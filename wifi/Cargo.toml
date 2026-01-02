@@ -1,0 +1,10 @@
+[package]
+name = "wifi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-idf-svc = "0.51"
+log = "0.4"
+anyhow = "1.0" 
+heapless = "0.8.0"

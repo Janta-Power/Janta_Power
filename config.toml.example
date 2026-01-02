@@ -1,0 +1,21 @@
+# Customer Configuration File
+# This file contains customer-specific settings
+# WARNING: This file contains sensitive information and should not be committed to version control
+
+[device]
+# Device identification settings
+tower_id = 1                            # Tower number at this location (1, 2, 3, etc.)
+
+[wifi]
+# Your WiFi network credentials
+ssid = "Power2"
+password = "@Powerfuture22"
+
+[location]
+# Geographic coordinates of your solar tracker installation
+latitude = 32.797868
+longitude = -96.835597
+altitude = 0.0
+timezone_offset_hours = -5              # UTC offset in hours (e.g., -6 for Central Time)
+
+ 

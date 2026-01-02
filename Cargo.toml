@@ -1,0 +1,67 @@
+[workspace]
+members = ["buttons", "rgb_led", "sensors", "clock", "wifi", "network", "ota"]
+
+[package]
+name = "tower"
+version = "0.1.0"
+authors = ["ms356 msalla@jantaus.com, abenezertsige <atsige@jantaus.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[package.metadata.esp-idf]# NEW
+partition_table = "partitions.csv" # NEW
+
+[[bin]]
+name = "tower"
+harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice and they don't increase the size on Flash
+opt-level = "z"
+
+[features]
+default = []
+
+experimental = ["esp-idf-svc/experimental"]
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.51", features = [
+    "critical-section",
+    "embassy-time-driver",
+    "embassy-sync",
+] }
+esp-idf-hal = { version = "0.45", default-features = false, features = [
+    "rmt-legacy",
+] }
+
+anyhow = "1.0"               #NEW: Moved from 1.0.93 to 1.0
+embedded-svc = "0.28.0"
+motion = { path = "motion" }
+clock = { path = "clock" }
+hdc1080 = { path = "hdc1080" }
+sensors = { path = "sensors" }
+buttons = { path = "buttons" }
+wifi = { path = "wifi" }            #New
+network = { path = "network" }          #New
+ota = { path = "ota" }              #New
+shared-bus = { git = "https://github.com/Sycrosity/shared-bus", version = "0.4.0", features = [
+    "std",
+] }
+embedded-hal = "1.0.0"
+rgb_led = { path = "rgb_led" }
+rgb = "0.8.50"
+#esp32-nimble = "0.11"
+heapless = "0.8.0"
+chrono = { version = "0.4.40", features = ["clock"] }
+semver = "1.0.26"               #New
+
+serde = { version = "1.0", features = ["derive"] } #New config parsing 
+toml = "0.8"  #New config parsing 
+
+[build-dependencies]
+embuild = "0.33.0"

@@ -1,31 +1,16 @@
-use std::{
-    str::FromStr,
-    time::{Duration, SystemTime},
-};
+// IMPORTS
+use std::time::{Duration, SystemTime};
 use chrono::{DateTime, FixedOffset, Utc};
 use clock::Clock;
 use log::*;
 use std::thread;
-//use esp32_nimble::{enums::*, uuid128, BLEAdvertisedDevice, BLEDevice, BLEScan};
-use esp_idf_hal::{sys::esp_app_desc, task::current};
-
-// Provide __pender function for embassy_executor
-// This function is called by embassy_executor to wake tasks
-#[no_mangle]
-pub extern "C" fn __pender() {
-    // For ESP-IDF with FreeRTOS, this is typically a no-op when using
-    // the embassy-time-driver feature, as the time driver handles wake-ups
-    // This stub satisfies the linker requirement
-}
-
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
         gpio::PinDriver,
         i2c::{I2cConfig, I2cDriver},
-        peripherals::Peripherals,
         prelude::*,
-        //        task::block_on,
     },
     log::EspLogger,
     nvs::{EspDefaultNvsPartition, EspNvs},
@@ -39,16 +24,22 @@ use ota::OtaUpdater;
 use semver::Version;
 use wifi::wifi::{Wifi, WifiState};
 
-fn main() -> anyhow::Result<()> {
-    // Required for ESP-IDF patches
-    esp_idf_svc::sys::link_patches();
-    //esp_app_desc!(); // FIND PURPOSE ELSE DELETE
 
-    // Initialize logger and system loop
+// This function must be provided when using embassy-sync/embassy-time-driver
+//Fixes the ldproxy linker error in 'tower'
+#[no_mangle]
+pub extern "C" fn __pender() {
+    // Keep it empty
+}
+
+// MAIN FUNCTION
+fn main() -> anyhow::Result<()> {
+    
+    // SYSTEM INITIALIZATION
+    esp_idf_svc::sys::link_patches();
     EspLogger::initialize_default();
     let sysloop = EspSystemEventLoop::take()?;
-
-    // Initialize peripherals and nvs
+    
     let peripherals = Peripherals::take().unwrap();
     let nvs_default = EspDefaultNvsPartition::take()?;
     let mut nvs = match EspNvs::new(nvs_default.clone(), "storage", true) {
@@ -59,54 +50,53 @@ fn main() -> anyhow::Result<()> {
         Err(e) => panic!("Could't get namespace {:?}", e),
     };
 
-    // Setting of sda and scl gpio pins as well as i2c
+     
+    // I2C BUS SETUP
+    
     let sda = peripherals.pins.gpio8;
     let scl = peripherals.pins.gpio9;
-
-    // I2C configuration
     let config = I2cConfig::new().baudrate(10_u32.kHz().into());
     let i2c = I2cDriver::new(peripherals.i2c0, sda, scl, &config).unwrap();
-
-    // Setting up i2c bus driver
     let bus: &'static _ = shared_bus::new_std!(I2cDriver = i2c).unwrap();
-    // let mut buttons = buttons::Buttons::new(
-    //     peripherals.pins.gpio5,
-    //     peripherals.pins.gpio4,
-    //     peripherals.pins.gpio6,
-    // );
 
-    // ======== Static credentials: Initialization for wifi and mqtt ========
-    // Write credentials into NVS (as raw bits)
+     
+    //CREDENTIALS CONFIGURATION 
+    todo!("Implement a .env");
+    
     let mqtt_user = "device1A";
-    match nvs.set_str("mqtt_user", mqtt_user){
+    match nvs.set_str("mqtt_user", mqtt_user) {
         Ok(_) => info!("Mqtt username updated"),
         Err(e) => error!("Mqtt username not updated {:?}", e),
-    }; 
-    let mqtt_pass= "device1A";
-    match nvs.set_str("mqtt_pass", mqtt_pass){
+    };
+    
+    let mqtt_pass = "device1A";
+    match nvs.set_str("mqtt_pass", mqtt_pass) {
         Ok(_) => info!("Mqtt password updated"),
         Err(e) => error!("Mqtt password not updated {:?}", e),
-    }; 
-
-    let wifi_ssid = "Power2"; //"jp5k";
-    match nvs.set_str("wifi_ssid", wifi_ssid){
+    };
+    
+    let wifi_ssid = "Power2";
+    match nvs.set_str("wifi_ssid", wifi_ssid) {
         Ok(_) => info!("Wifi ssid updated"),
         Err(e) => error!("Wifi ssid not updated {:?}", e),
-    }; 
-    let wifi_pass= "@Powerfuture22";
-    match nvs.set_str("wifi_pass", wifi_pass){
+    };
+    
+    let wifi_pass = "@Powerfuture22";
+    match nvs.set_str("wifi_pass", wifi_pass) {
         Ok(_) => info!("Wifi password updated"),
         Err(e) => error!("Wifi password not updated {:?}", e),
-    }; 
-
+    };
+    
     let offset_hours = -5;
-    match nvs.set_i32("offset_hours", offset_hours){
+    match nvs.set_i32("offset_hours", offset_hours) {
         Ok(_) => info!("Timezone offset has been updated"),
         Err(e) => error!("Timezone offset was not updated {:?}", e),
     };
 
-    // ======== Wifi: Initialization ========
-    let mut buffer = [0u8; 64]; // Adjust size as needed
+     
+    // WIFI INITIALIZATION
+    
+    let mut buffer = [0u8; 64];
     let real_wifi_ssid = nvs
         .get_str("wifi_ssid", &mut buffer)?
         .expect("Wifi ssid not found")
@@ -117,13 +107,15 @@ fn main() -> anyhow::Result<()> {
         .to_string();
 
     let mut wifi = Wifi::new(peripherals.modem, sysloop.clone(), nvs_default)?;
-	wifi.connect(&real_wifi_ssid, &real_wifi_pass).expect("Wi-Fi connection failed");
-	info!("Current wifi state: {:?}", wifi.state());
-    if wifi.state() == WifiState::Disconnected{
+    wifi.connect(&real_wifi_ssid, &real_wifi_pass).expect("Wi-Fi connection failed");
+    info!("Current wifi state: {:?}", wifi.state());
+    if wifi.state() == WifiState::Disconnected {
         wifi.reconnect_if_disconnected()?;
     }
 
-    // Initializing ntp and local time
+     
+    //TIME SYNCHRONIZATION
+
     let ntp = EspSntp::new_default().unwrap();
     info!("Synchronizing with NTP Server");
     while ntp.get_sync_status() != SyncStatus::Completed {}
@@ -132,17 +124,17 @@ fn main() -> anyhow::Result<()> {
     let st_now = SystemTime::now();
     let dt_now_utc: DateTime<Utc> = st_now.clone().into();
     let timezone_offset_hours: i32 = nvs.get_i32("offset_hours")?.unwrap_or(-5);
-    //let timezone_offset_hours: i32 = -5; 
     let local_time: DateTime<FixedOffset> = DateTime::from_naive_utc_and_offset(
         dt_now_utc.naive_utc(),
-        //FixedOffset::west_opt(5 * 3600).unwrap(),              // 
-        FixedOffset::east_opt(timezone_offset_hours * 3600).unwrap(),  
+        FixedOffset::east_opt(timezone_offset_hours * 3600).unwrap(),
     );
 
     let formatted_time = format!("{}", local_time.format("%d/%m/%Y %H:%M:%S"));
     info!("{}", formatted_time);
 
-    // ======== Mqtt: Initialization ========
+     
+    //MQTT INITIALIZATION
+    
     let real_mqtt_user = nvs
         .get_str("mqtt_user", &mut buffer)?
         .expect("Mqtt username not found")
@@ -152,7 +144,6 @@ fn main() -> anyhow::Result<()> {
         .expect("Mqtt password not found")
         .to_string();
 
-    // Create MQTT client using the Wi-Fi TCP/IP stack
     let mut mqtt = Box::new(Mqtt::new_mqtt(
         "mqttS://mqtt.jantaus.com:9443",
         "device1A_pub",
@@ -160,182 +151,185 @@ fn main() -> anyhow::Result<()> {
         &real_mqtt_pass,
     )?);
 
-    // ======== Boot Validation ========    
+     
+    //BOOT VALIDATION
+    
     let first_boot = nvs.get_u8("first_boot")?.unwrap_or(1);
-
-    // Run boot_diagnostic check
     let boot_diagnostic_result = boot_diagnostic(&mut wifi, &mut mqtt);
 
     if first_boot == 1 {
         info!("First boot, now performing boot diagnostics");
-        let mut valid_ota = EspOta::new().expect("Failed to get OTA instance");// Minimal OTA instance for validation
-
+        let mut valid_ota = EspOta::new().expect("Failed to get OTA instance");
         let running_slot = valid_ota.get_running_slot();
         info!("This is the running boot slot {:?}", running_slot);
 
         if running_slot.unwrap().label == "factory" {
             info!("Running from factory partition -> skipping OTA validity marking");
             nvs.set_u8("first_boot", 0)?;
-        } else{
-            // Mark firmware valid or rollback
+        } else {
             if boot_diagnostic_result {
                 info!("Boot validation passed, now marking firmware as valid");
                 valid_ota.mark_running_slot_valid()?;
                 nvs.set_u8("first_boot", 0)?;
-                
             } else {
                 error!("Boot validation failed, rolling back firmware");
-                valid_ota.mark_running_slot_invalid_and_reboot(); // reboots immediately
+                valid_ota.mark_running_slot_invalid_and_reboot();
             }
         }
-    }else {
+    } else {
         info!("Normal boot firmware already validated");
     }
 
-    // ======== OTA: Initialization ========
-    // Create a version buffer large enough for the version string
-    let mut version_buf = [0u8; 32]; // Adjust size as needed
+     
+    //OTA UPDATE SYSTEM
 
-    info!("Setting the firmware version..."); // RESETTING THE FIRMWARE VERSION
-    nvs.set_str("version", "1.0.4")?; // RESETTING THE FIRMWARE VERSION
+    let mut version_buf = [0u8; 32];
+    info!("Setting the firmware version...");
+    nvs.set_str("version", "1.0.4")?;
 
-    // Default version if nothing is stored
     const DEFAULT_VERSION: &str = "1.0.4";
-    // Read the current version from NVS
     let current_version: Version = nvs
         .get_str("version", &mut version_buf)?
         .map(|s| s.trim().parse::<Version>())
-        .transpose()? // converts Option<Result<..>> into Result<Option<..>>
+        .transpose()?
         .unwrap_or_else(|| Version::parse(DEFAULT_VERSION).unwrap());
 
-    // Publishing a message about the current running version
     info!("The current firmware version is: {}", current_version.to_string());
     let mut payload = format!("The current firmware version is: {}", current_version.to_string());
     mqtt.publish("device1A/firmware/version", payload.as_bytes())?;
 
-    // Creates an instance of OTA crate
-    let mut updater = OtaUpdater::new_ota(current_version.clone(), &mut mqtt, Some("device1A"), Some("device1A")).expect("Failed to create OTA updater instance");
+    let mut updater = OtaUpdater::new_ota(
+        current_version.clone(),
+        &mut mqtt,
+        Some("device1A"),
+        Some("device1A"),
+    )
+    .expect("Failed to create OTA updater instance");
 
-    // Run version compare
     info!("Checking for new OTA update in 3 seconds...");
     thread::sleep(Duration::from_secs(3));
     updater.run_version_compare(&mut nvs)?;
-    
-    // Set tower configuration values
+
+     
+    //TOWER CONFIGURATION
+
     let tower_latitude: f64 = 32.797868;
-    match nvs.set_str("tower_latitude", &tower_latitude.to_string()){
+    match nvs.set_str("tower_latitude", &tower_latitude.to_string()) {
         Ok(_) => info!("Tower latitude has been updated"),
         Err(e) => error!("Tower latitude was not updated {:?}", e),
     };
 
     let tower_longitude: f64 = -96.835597;
-    match nvs.set_str("tower_longitude", &tower_longitude.to_string()){
+    match nvs.set_str("tower_longitude", &tower_longitude.to_string()) {
         Ok(_) => info!("Tower longitude has been updated"),
         Err(e) => error!("Tower longitude was not updated {:?}", e),
     };
 
-    // Load tower configuration values
     let tower_id: u32 = 1;
     let latitude = nvs
         .get_str("tower_latitude", &mut buffer)?
         .unwrap_or("0")
-        .parse() 
+        .parse()
         .unwrap_or(0.0);
-    //let latitude: f64 = 32.797868;
     let longitude = nvs
         .get_str("tower_longitude", &mut buffer)?
         .unwrap_or("0")
         .parse()
         .unwrap_or(0.0);
-    //let longitude: f64 = -96.835597;
-    let altitude: f64 = 0.0; 
+    let altitude: f64 = 0.0;
 
     info!("Retrieved latitude: {}, and longitude: {}", latitude, longitude);
-
-    
     info!("Tower id: {}, Lat: {}, Lon: {}, Alt: {}", tower_id, latitude, longitude, altitude);
-    
-    // Set new instance of clock crate 
-    let mut calculation = Clock::new(bus.acquire_i2c(), latitude, longitude, altitude); // Create a new clock object 
-    calculation.set_date_time(&local_time.naive_local()); // Set the current date and time 
-    
-    //let mut relay = PinDriver::output(peripherals.pins.gpio15).unwrap();
-    //let mut lmsw = PinDriver::input(peripherals.pins.gpio6).unwrap();
-    //lmsw.set_pull(esp_idf_hal::gpio::Pull::Down);
-    let mut led = Led::new(peripherals.pins.gpio7, peripherals.rmt.channel0).unwrap();
 
-    // Set motion pins
+     
+    //HARDWARE INITIALIZATION
+    
+    let mut calculation = Clock::new(bus.acquire_i2c(), latitude, longitude, altitude);
+    calculation.set_date_time(&local_time.naive_local());
+    
+    let mut led = Led::new(peripherals.pins.gpio7, peripherals.rmt.channel0).unwrap();
+    
     let mut motion = Motion::new(
         peripherals.pins.gpio15,   // CCW Motor
         peripherals.pins.gpio16,   // CW Motor
-        peripherals.pins.gpio17,   // Relay 
-        peripherals.pins.gpio14,   // Limit Switch 
+        peripherals.pins.gpio17,   // Relay
+        peripherals.pins.gpio14,   // Limit Switch
     );
-   
-    motion.init();          // Initialize motor driver parameters
-    led.display_healthy();  // Show healthy LED status
-    motion.run();           // Ensure motor driver is in a ready state
+    
+    motion.init();
+    led.display_healthy();
+    motion.run();
 
-    // Initialize and store the actual tracker heading in NVS
+     
+    // HEADING INITIALIZATION
+
     let heading_tag = "heading";
     let mut actual_heading: f32 = 90.0;
 
-    // Write initial heading to NVS (as raw bits)
     match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-         Ok(_) => info!("heading updated"),
-         // You can find the meaning of the error codes in the output of the error branch in:
-         // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-         Err(e) => error!("heading not updated {:?}", e),
-    }; 
+        Ok(_) => info!("heading updated"),
+        Err(e) => error!("heading not updated {:?}", e),
+    };
 
-    // Load heading from NVS if present, otherwise keep default
     match nvs.get_u32(heading_tag).unwrap() {
         Some(v) => {
             info!("{:?} = {:?}", heading_tag, v);
             actual_heading = f32::from_bits(v);
         }
         None => info!("{:?} not found", heading_tag),
-    }; 
+    };
 
-    let mut mb = PinDriver::input(peripherals.pins.gpio5).unwrap();  // Maintenance 
+    let mut mb = PinDriver::input(peripherals.pins.gpio5).unwrap();  // Maintenance Button
     let mut eb = PinDriver::input(peripherals.pins.gpio4).unwrap();  // East Button
     let mut wb = PinDriver::input(peripherals.pins.gpio6).unwrap();  // West Button
 
-    // --- ONE-TIME HOMING: Ensure tracker is at physical reference before tracking begins ---
+     
+    // HOMING SEQUENCE
+    todo!("Implement an encoder to re-position in case of power failure");
+
     let limit_sw_status = motion.find_limit_switch_cw();
-    match limit_sw_status{
+    match limit_sw_status {
         true => log::info!("Limit switch has returned true"),
         false => {
             log::error!("Limit switch has returned false, limit switch could not be found");
-            loop{
+            loop {
                 if let Err(e) = mqtt.publish("device1A/tower/status", b"Critical failure: Limit switch failure!") {
                     log::error!("Failed to publish critical error message: {:?}", e);
                 }
-                thread::sleep(Duration::from_secs(900));// Loop every 15 minutes
+                thread::sleep(Duration::from_secs(900)); // Loop every 15 minutes
             }
         }
     }
-    // Find_limit_switch_cw
-    thread::sleep(Duration::from_secs(5)); // 
+    thread::sleep(Duration::from_secs(5));
+
+     
+    // MAIN TRACKING LOOP
 
     loop {
-        let st_now = SystemTime::now();//new
-        let dt_now_utc: DateTime<Utc> = st_now.into();//new
+        let st_now = SystemTime::now();
+        let dt_now_utc: DateTime<Utc> = st_now.into();
         let local_time: DateTime<FixedOffset> = DateTime::from_naive_utc_and_offset(
-        dt_now_utc.naive_utc(),
-        FixedOffset::east_opt(timezone_offset_hours * 3600).unwrap());
+            dt_now_utc.naive_utc(),
+            FixedOffset::east_opt(timezone_offset_hours * 3600).unwrap(),
+        );
         let current_datetime = format!("{}", local_time.format("%d/%m/%Y %H:%M:%S"));
 
         info!("Actual Heading: {}", motion.location());
         info!("Current datetime: {}", current_datetime.clone());
-        //std::thread::sleep(Duration::from_secs(10)); // 5-minute cycle */
 
-        let now = std::time::Instant::now();  // Timer to measure how long this tracking loop iteration takes
+        let now = std::time::Instant::now();
 
-        // Perform solar tracking
-        let tracking_done = motion.set_tower_position(&mut calculation, actual_heading, 0, &mut mqtt, current_version.clone(), &mut nvs, &mut wifi, current_datetime.clone());
+        let tracking_done = motion.set_tower_position(
+            &mut calculation,
+            actual_heading,
+            0,
+            &mut mqtt,
+            current_version.clone(),
+            &mut nvs,
+            &mut wifi,
+            current_datetime.clone(),
+        );
 
-        // Update heading if movement occurred
         if !tracking_done {
             actual_heading = motion.location();
             match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
@@ -348,169 +342,26 @@ fn main() -> anyhow::Result<()> {
         }
 
         info!("Tracking loop duration (v1.0.4): {:?}", now.elapsed());
-        if wifi.state() == WifiState::Disconnected{
+        
+        if wifi.state() == WifiState::Disconnected {
             warn!("Wifi disconnected, attempting to reconnect...");
             wifi.reconnect_if_disconnected()?;
         }
+        
         payload = format!("The current firmware version is: {}", current_version.to_string());
         mqtt.publish("device1A/firmware/version", payload.as_bytes())?;
         
-        std::thread::sleep(Duration::from_secs(300)); // 5-minute cycle  
-
+        std::thread::sleep(Duration::from_secs(300)); // 5-minute cycle
     }
-    //loop {
-        //log::info!("Limit Switch On: {}", motion.switch_pressed());
-        //motion.find_limit_switch();
-        //let now = std::time::Instant::now();                    // Starts a high-resolution timer to measure elapsed time
-        //std::thread::sleep(Duration::from_millis(1000));        // Pauses the thread for 1000 milliseconds (1 second)
-        //std::thread::sleep(Duration::from_nanos(50));
-
-/*         log::info!("Time Gap: {:?}", now.elapsed());            // Logs how much time passed since now
-        log::info!("Maintenance Pressed: {:?}", mb.is_high());  // Reads GPIO input states
-        log::info!("East Pressed: {:?}", eb.is_high());
-        log::info!("West Pressed: {:?}", wb.is_high()); */
-
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(5000);    // Pause the thread for 5 seconds
-        // motion.flip_relay();                                 // Toggle motor 
-        // motion.move_by(((20.0 / 360.0) * (20000.0 * 50.0 * 84.0)) as i64);
-        // motion.flip_relay();
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(10000);
-        // log::info!("Limit Switch On: {}", lmsw.is_high());
-        // log::info!("Limit Switch Level: {:?}", lmsw.get_level());
-        // motion.flip_relay();
-        // motion.move_by(((-20.0 / 360.0) * (20000.0 * 50.0 * 84.0)) as i64);
-        // motion.flip_relay();
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(10000);
-
-        // let val = motion.set_tower_position(&mut calculation, actual_heading as f32, 0);
-        // let val = motion.set_tower_position(&mut calculation, actual_heading as f32, 0);
-        // actual_heading = motion.location();
-        // log::info!("{},", actual_heading);
-
-        // match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-        //     Ok(_) => log::info!("heading updated"),
-        //     // You can find the meaning of the error codes in the output of the error branch in:
-        //     // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-        //     Err(e) => log::info!("heading not updated {:?}", e),
-        // };
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(180000);
-    //}
- 
-/*     loop {
-        block_on(async {
-            let ble_device = BLEDevice::take();
-            ble_device
-                .set_power(PowerType::Default, PowerLevel::P9)
-                .unwrap_or_default();
-            let device_name = b"Axum-0.1";
-            let mut ble_scan = BLEScan::new();
-            loop {
-                esp_idf_svc::hal::delay::FreeRtos::delay_ms(1500);
-                let device = ble_scan
-                    .active_scan(true)
-                    .interval(100)
-                    .window(99)
-                    .start(ble_device, 5000, |device, data| {
-                        if let Some(name) = data.name() {
-                            if **name == *device_name {
-                                //log::info!("{:?}", data.service_data());
-                                //log::info!("RSSI: {}", device.rssi());
-                                return Some(*device);
-                            }
-                        }
-                        None::<BLEAdvertisedDevice>
-                    })
-                    .await;
-
-                if let Ok(Some(device)) = device {
-                    let mut client = ble_device.new_client();
-                    client.on_connect(|client| {
-                        log::info!(" ");
-                        client
-                            .update_conn_params(120, 120, 0, 65535)
-                            .unwrap_or_default();
-                    });
-                    client.connect(&device.addr()).await.unwrap_or_default();
-                    loop {
-                        let mut actual_balance = 0;
-                        let service = client
-                            .get_service(uuid128!("00001812-0000-1000-8000-00805f9b34fb"))
-                            .await;
-                        if let Ok(service) = service {
-                            let mut characteristics =
-                                service.get_characteristics().await.unwrap_or_default();
-                            let ldre = characteristics.next();
-                            if let Some(ldre) = ldre {
-                                let ldr = ldre.read_value().await;
-                                if let Ok(ldr) = ldr {
-                                    let actual = <[u8; 4]>::try_from(ldr).unwrap();
-                                    //actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("LDRE: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-
-                            let ldrw = characteristics.next();
-                            if let Some(ldrw) = ldrw {
-                                let ldr = ldrw.read_value().await;
-                                if let Ok(ldr) = ldr {
-                                    let actual = <[u8; 4]>::try_from(ldr).unwrap();
-                                    //actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("LDRW: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-
-                            let bal = characteristics.next();
-                            if let Some(bal) = bal {
-                                let balance = bal.read_value().await;
-                                if let Ok(balance) = balance {
-                                    let actual = <[u8; 4]>::try_from(balance).unwrap();
-                                    actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("Balance: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                        log::info!("Heading: {}", actual_heading);
-                        log::info!("Balance: {}", actual_balance);
-
-                        if actual_heading == 0.0 {
-                            break;
-                        }
-                        let val = motion.set_tower_position(
-                            &mut calculation,
-                            actual_heading as f32,
-                            actual_balance,
-                        );
-                        actual_heading = motion.location();
-                        match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-                            Ok(_) => log::info!("heading updated"),
-                            // You can find the meaning of the error codes in the output of the error branch in:
-                            // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-                            Err(e) => log::info!("heading not updated {:?}", e),
-                        };
-                        if !val {
-                            continue;
-                        }
-                        esp_idf_svc::hal::delay::FreeRtos::delay_ms(120000);
-                    }
-                    client.disconnect().unwrap_or_default();
-                }
-                //let data = deserialize(device_data.1.service_data().unwrap().service_data);
-                //log::info!("{:?}", data);
-                //let val = motion.set_tower_position(&mut calculation, data.loc, data.acc, data.bgp);}
-            }
-            //anyhow::Ok(())
-        })
-    } */
 }
 
+ 
+// BOOT DIAGNOSTIC FUNCTION
+ 
 fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
-    // Let system settle
     info!("Starting boot validation in 5 seconds...");
     thread::sleep(Duration::from_secs(5));
 
-    // Wifi check
     match wifi.state() {
         WifiState::Connected(ip) => {
             info!("Wi-Fi connected with IP: {}", ip);
@@ -525,13 +376,11 @@ fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
         }
     }
 
-    // MQTT check
     const MAX_RETRIES: u8 = 3;
 
     for attempt in 1..=MAX_RETRIES {
         info!("Boot diagnostic MQTT attempt {}/{}", attempt, MAX_RETRIES);
 
-        // Wait until the MQTT client reports connected
         let mut waited = 0;
         while !mqtt.is_connected() && waited < 12000 {
             thread::sleep(Duration::from_millis(3000));
@@ -540,10 +389,9 @@ fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
 
         if !mqtt.is_connected() {
             warn!("MQTT not connected yet, retrying...");
-            continue; // next attempt
+            continue;
         }
 
-        // Try publishing a test message
         match mqtt.publish("device1A/boot", b"Boot check...") {
             Ok(_) => {
                 info!("MQTT boot diagnostic publish succeeded...");
@@ -553,13 +401,12 @@ fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
                 error!("MQTT publish failed immediately: {:?}", e);
                 if attempt == MAX_RETRIES {
                     error!("All MQTT boot diagnostic attempts failed...");
-                    return false; // give up after max retries
+                    return false;
                 }
-                thread::sleep(Duration::from_millis(1000)); // backoff
+                thread::sleep(Duration::from_millis(1000));
                 continue;
             }
         }
     }
-    return false; 
-    //return true;
+    return false;
 }

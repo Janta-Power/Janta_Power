@@ -30,11 +30,7 @@ experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.51", features = [
-    "critical-section",
-    "embassy-time-driver",
-    "embassy-sync",
-] }
+esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 esp-idf-hal = { version = "0.45", default-features = false, features = [
     "rmt-legacy",
 ] }

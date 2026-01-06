@@ -2,7 +2,7 @@ use accel_stepper::{Driver, OperatingSystemClock, StepAndDirection};
 use astronav::coords::noaa_sun::NOAASun;
 use clock::Clock;
 use std::time::{Duration, Instant};
-use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Input, Output, PinDriver};
+use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Gpio21, Gpio47, Input, Output, PinDriver};
 use esp_idf_svc::nvs::*;
 use network::mqtt::Mqtt;
 use wifi::wifi::{Wifi, WifiState};
@@ -42,24 +42,49 @@ pub struct Motion<'a> {
     prev_balance: i32,
     relay: PinDriver<'a, Gpio17, Output>,
     lmsw: PinDriver<'a, Gpio14, Input>,
-    // Encoder support for L2 state (optional - uses stepper position as fallback)
+    // Encoder support for L2 state
+    encoder_a: PinDriver<'a, Gpio21, Input>,  // Encoder channel A (GPIO 21)
+    encoder_b: PinDriver<'a, Gpio47, Input>,  // Encoder channel B (GPIO 47)
     encoder_count: i64,
     encoder_target: Option<i64>,
     encoder_stop_armed: bool,
     last_encoder_for_stall: i64,
     stall_timer_start: Option<Instant>,
+    // Quadrature encoder state tracking
+    encoder_last_state: u8,  // Last state of A and B pins (0-3)
+    // Encoder speed/acceleration tracking
+    encoder_last_count: i64,
+    encoder_last_time: Option<Instant>,
+    encoder_last_speed_dps: f64,  // Last calculated encoder speed in degrees per second
+    encoder_last_speed_time: Option<Instant>,
+    log_counter: u32,  // Counter for periodic logging
 }
 
 // CW: direction
 // CCW: step
 impl Motion<'_> {
-    pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14) -> Motion<'a> {
+    pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14, enc_a: Gpio21, enc_b: Gpio47) -> Motion<'a> {
         let step = PinDriver::output(p10).unwrap();
         let direction = PinDriver::output(p11).unwrap();
         let relay = PinDriver::output(p7).unwrap();
         let mut lmsw = PinDriver::input(p6).unwrap();
         lmsw.set_pull(esp_idf_svc::hal::gpio::Pull::Down)
             .unwrap_or_default();
+        
+        // Initialize encoder pins with pull-up resistors
+        let mut encoder_a = PinDriver::input(enc_a).unwrap();
+        encoder_a.set_pull(esp_idf_svc::hal::gpio::Pull::Up)
+            .unwrap_or_default();
+        let mut encoder_b = PinDriver::input(enc_b).unwrap();
+        encoder_b.set_pull(esp_idf_svc::hal::gpio::Pull::Up)
+            .unwrap_or_default();
+        
+        // Read initial encoder state
+        let a_init = encoder_a.is_high();
+        let b_init = encoder_b.is_high();
+        let initial_state = ((a_init as u8) << 1) | (b_init as u8);
+        log::info!("Encoder initialized: GPIO21 (A)={}, GPIO47 (B)={}, initial_state={:02b}", 
+                   a_init, b_init, initial_state);
 
         Motion {
             location: 0.0,
@@ -72,12 +97,22 @@ impl Motion<'_> {
             prev_balance: 0,
             relay,
             lmsw,
+            // Encoder pin drivers
+            encoder_a,
+            encoder_b,
             // Encoder state initialization
             encoder_count: 0,
             encoder_target: None,
             encoder_stop_armed: false,
             last_encoder_for_stall: 0,
             stall_timer_start: None,
+            encoder_last_state: initial_state,
+            // Speed/acceleration tracking initialization
+            encoder_last_count: 0,
+            encoder_last_time: None,
+            encoder_last_speed_dps: 0.0,
+            encoder_last_speed_time: None,
+            log_counter: 0,
         }
     }
 
@@ -158,9 +193,25 @@ impl Motion<'_> {
     }
 
     pub fn run(&mut self) {
+        // Reset logging counter for this movement
+        self.log_counter = 0;
+        if self.encoder_last_time.is_none() {
+            self.encoder_last_time = Some(Instant::now());
+            self.encoder_last_count = self.encoder_count;
+        }
+        
         loop {
             if self.motor.is_running() {
                 let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
+                
+                // Update encoder position from GPIO pins during movement
+                self.update_encoder_from_pins();
+                
+                // Log detailed status every 10 iterations
+                self.log_counter += 1;
+                if self.log_counter % 10 == 0 {
+                    self.log_detailed_status();
+                }
             } else {
                 break;
             }
@@ -179,25 +230,163 @@ impl Motion<'_> {
     
     /// Reset encoder count to zero
     fn reset_encoder(&mut self) {
+        let old_count = self.encoder_count;
         self.encoder_count = 0;
         self.last_encoder_for_stall = 0;
         self.stall_timer_start = None;
+        // Read current encoder state to initialize last_state
+        self.encoder_last_state = ((self.encoder_a.is_high() as u8) << 1) | (self.encoder_b.is_high() as u8);
+        // Reset speed/acceleration tracking
+        self.encoder_last_count = 0;
+        self.encoder_last_time = Some(Instant::now());
+        self.encoder_last_speed_dps = 0.0;
+        self.encoder_last_speed_time = None;
+        self.log_counter = 0;
+        log::info!("Encoder reset: count {} -> 0, initial state: {:02b}", old_count, self.encoder_last_state);
     }
     
-    /// Update encoder count from stepper position (proxy for real encoder)
-    /// In future, this can be replaced with actual encoder reading
-    fn update_encoder_from_stepper(&mut self) {
-        // Use stepper position as encoder proxy
-        // Convert stepper steps to encoder counts
-        // Formula: encoder_count = (stepper_position / OUT_STEPS_PER_REV) * ENCODER_COUNTS_PER_REV
+    /// Convert encoder count to degrees
+    fn encoder_count_to_degrees(&self, count: i64) -> f64 {
+        (count as f64 / ENCODER_COUNTS_PER_REV as f64) * 360.0
+    }
+    
+    /// Convert stepper position to degrees
+    fn stepper_position_to_degrees(&self, steps: i64) -> f64 {
+        (steps as f64 / OUT_STEPS_PER_REV) * 360.0
+    }
+    
+    /// Calculate encoder speed in degrees per second
+    fn calculate_encoder_speed_dps(&mut self) -> f64 {
+        let now = Instant::now();
+        let current_count = self.encoder_count;
+        
+        if let Some(last_time) = self.encoder_last_time {
+            let dt = now.duration_since(last_time).as_secs_f64();
+            if dt > 0.0 {
+                let d_count = current_count - self.encoder_last_count;
+                let d_degrees = self.encoder_count_to_degrees(d_count);
+                let speed_dps = d_degrees / dt;
+                
+                self.encoder_last_count = current_count;
+                self.encoder_last_time = Some(now);
+                self.encoder_last_speed_dps = speed_dps;
+                
+                return speed_dps;
+            }
+        } else {
+            self.encoder_last_time = Some(now);
+            self.encoder_last_count = current_count;
+        }
+        
+        self.encoder_last_speed_dps
+    }
+    
+    /// Calculate encoder acceleration in degrees per second squared
+    fn calculate_encoder_accel_dps2(&mut self) -> f64 {
+        let now = Instant::now();
+        let current_speed = self.calculate_encoder_speed_dps();
+        let last_speed = self.encoder_last_speed_dps;
+        
+        if let Some(last_speed_time) = self.encoder_last_speed_time {
+            let dt = now.duration_since(last_speed_time).as_secs_f64();
+            if dt > 0.0 && dt < 1.0 {  // Only calculate if time difference is reasonable
+                let d_speed = current_speed - last_speed;
+                let accel_dps2 = d_speed / dt;
+                
+                self.encoder_last_speed_time = Some(now);
+                
+                return accel_dps2;
+            }
+        } else {
+            self.encoder_last_speed_time = Some(now);
+        }
+        
+        0.0
+    }
+    
+    /// Log detailed encoder/stepper status in the format requested
+    fn log_detailed_status(&mut self) {
         let stepper_pos = self.motor.current_position();
-        self.encoder_count = ((stepper_pos as f64 / OUT_STEPS_PER_REV) * ENCODER_COUNTS_PER_REV as f64) as i64;
+        let encoder_count = self.encoder_count;
+        
+        // Calculate speeds and accelerations
+        let enc_speed_dps = self.calculate_encoder_speed_dps();
+        let enc_accel_dps2 = self.calculate_encoder_accel_dps2();
+        
+        // Convert stepper speed from steps/sec to degrees/sec
+        let stepper_speed_steps_s = self.motor.speed();
+        let given_speed_dps = (stepper_speed_steps_s as f64 / OUT_STEPS_PER_REV) * 360.0;
+        
+        // Set acceleration in degrees per second squared
+        // Acceleration is in steps/sec^2, convert to degrees/sec^2
+        let set_accel_dps2 = (self.acceleration as f64 / OUT_STEPS_PER_REV) * 360.0;
+        
+        log::info!(
+            "Stepper={} | Encoder={} | EncSpeed(dps)={:.3} | GivenSpeed(dps)={:.3} | EncAccel(dps2)={:.3} | SetAccel={:.3}",
+            stepper_pos,
+            encoder_count,
+            enc_speed_dps,
+            given_speed_dps,
+            enc_accel_dps2,
+            set_accel_dps2
+        );
     }
     
-    /// Read current encoder position (uses stepper as proxy)
+    /// Read quadrature encoder and update count
+    /// Implements quadrature decoding: tracks state transitions to determine direction
+    /// State encoding: A=MSB, B=LSB (00, 01, 10, 11)
+    fn update_encoder_from_pins(&mut self) {
+        // Read current encoder pin states
+        let a_state = self.encoder_a.is_high();
+        let b_state = self.encoder_b.is_high();
+        let current_state = ((a_state as u8) << 1) | (b_state as u8);
+        
+        // Quadrature decoder state machine
+        // Valid transitions: 00->01->11->10->00 (CW) or 00->10->11->01->00 (CCW)
+        let last_state = self.encoder_last_state;
+        
+        // Check for valid state transition
+        if current_state != last_state {
+            let old_count = self.encoder_count;
+            // Determine direction based on state transition
+            // CW: 00->01->11->10->00 (increment)
+            // CCW: 00->10->11->01->00 (decrement)
+            match (last_state, current_state) {
+                // Clockwise transitions
+                (0b00, 0b01) | (0b01, 0b11) | (0b11, 0b10) | (0b10, 0b00) => {
+                    self.encoder_count += 1;
+                    log::debug!("Encoder: CW transition {:02b}->{:02b}, count: {}->{}", 
+                               last_state, current_state, old_count, self.encoder_count);
+                }
+                // Counter-clockwise transitions
+                (0b00, 0b10) | (0b10, 0b11) | (0b11, 0b01) | (0b01, 0b00) => {
+                    self.encoder_count -= 1;
+                    log::debug!("Encoder: CCW transition {:02b}->{:02b}, count: {}->{}", 
+                               last_state, current_state, old_count, self.encoder_count);
+                }
+                // Invalid transitions (noise or missed state) - log and ignore
+                _ => {
+                    log::warn!("Encoder: Invalid transition {:02b}->{:02b}, ignoring", 
+                              last_state, current_state);
+                }
+            }
+            
+            self.encoder_last_state = current_state;
+        }
+    }
+    
+    /// Read current encoder position from GPIO pins
     fn read_encoder(&mut self) -> i64 {
-        self.update_encoder_from_stepper();
+        self.update_encoder_from_pins();
         self.encoder_count
+    }
+    
+    /// Get current encoder state for debugging (returns A, B, state, count)
+    pub fn get_encoder_status(&mut self) -> (bool, bool, u8, i64) {
+        let a = self.encoder_a.is_high();
+        let b = self.encoder_b.is_high();
+        let state = ((a as u8) << 1) | (b as u8);
+        (a, b, state, self.encoder_count)
     }
     
     /// Calculate encoder target count for a given angle in degrees
@@ -208,7 +397,7 @@ impl Motion<'_> {
     /// Check for stall condition (encoder not changing while stepper is moving)
     fn check_stall(&mut self) -> bool {
         let enc_now = self.read_encoder();
-        let step_speed = self.motor.speed(); // steps/sec (actual ramped speed) - returns f32
+        let step_speed = self.motor.speed(); // steps/sec (actual ramped speed)
         let stepper_trying_to_move = step_speed.abs() > 1.0;
         
         if stepper_trying_to_move {
@@ -245,6 +434,10 @@ impl Motion<'_> {
         log::info!("===== L2 ENCODER-BASED MOVE START =====");
         log::info!("TargetAngle_deg: {:.2}", target_angle_deg);
         
+        // Log current encoder status before reset
+        let (a, b, state, count) = self.get_encoder_status();
+        log::info!("Encoder before reset: A={}, B={}, state={:02b}, count={}", a, b, state, count);
+        
         // Reset encoder
         self.reset_encoder();
         
@@ -276,8 +469,14 @@ impl Motion<'_> {
                 let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
             }
             
-            // Update encoder position
-            self.update_encoder_from_stepper();
+            // Update encoder position from GPIO pins
+            self.update_encoder_from_pins();
+            
+            // Log detailed status every 10 iterations (adjust frequency as needed)
+            self.log_counter += 1;
+            if self.log_counter % 10 == 0 {
+                self.log_detailed_status();
+            }
             
             // Check encoder-based termination
             if self.encoder_stop_armed {
@@ -322,9 +521,14 @@ impl Motion<'_> {
         log::info!("FinalStepper_steps: {}", self.motor.current_position());
         log::info!("FinalEncoder_cnt: {}", self.encoder_count);
         
+        // Log final encoder pin states
+        let (a, b, state, _) = self.get_encoder_status();
+        log::info!("Final encoder pins: A={}, B={}, state={:02b}", a, b, state);
+        
         // Update location based on encoder position
         let final_angle = (self.encoder_count as f64 / ENCODER_COUNTS_PER_REV as f64) * 360.0;
         self.update_position(final_angle as f32);
+        log::info!("Final angle from encoder: {:.2}°", final_angle);
         
         true
     }
@@ -411,13 +615,12 @@ impl Motion<'_> {
         &mut self,
         clock: &mut Clock<I2C>,
         location: f32,
-        _balance: i32,  // Currently unused in L2, kept for API compatibility
+        balance: i32,
         mqtt: &mut Mqtt,
         current_version: Version,
         nvs: &mut EspNvs<T>,
         wifi: &mut Wifi<'_>,
         formatted_time: String,
-        use_legacy_l1_tracking: bool,  // Flag to override: true = use L1 (legacy), false = use L2 (default)
     ) -> bool {
         self.update_position(location);
         log::info!("{},", clock.after_sunrise());
@@ -437,39 +640,19 @@ impl Motion<'_> {
             log::info!("Actual Location: {}", location);
             log::info!("Angle Offset: {}", angle_offset);
             log::info!("Sun Angle: {}", sun.azimuth_in_deg());
-            log::info!("Tracking mode: {}", if use_legacy_l1_tracking { "L1 (Legacy)" } else { "L2 (Encoder-based)" });
             
-            // State management based on tracking mode flag
-            if use_legacy_l1_tracking {
-                // LEGACY MODE: Use L1 (step-based) tracking
-                if angle_offset.abs() > 5.0 {
-                    self.relay.set_high().unwrap_or_default();
-                    self.tracking_state = TrackingState::L1;
-                }
-                // If angle is very close (<= 1°), we're done (legacy behavior)
-                if angle_offset.abs() <= 1.0 && self.tracking_state == TrackingState::L1 {
-                    let _ = self.relay.set_low().unwrap_or_default();
-                    return true;
-                }
-            } else {
-                // MODERN MODE: Use L2 (encoder-based) tracking by default
-                if angle_offset.abs() > 5.0 {
-                    // Large offset: use L1 for coarse movement first
-                    self.relay.set_high().unwrap_or_default();
-                    self.tracking_state = TrackingState::L1;
-                } else if angle_offset.abs() <= 5.0 {
-                    // Small offset: use L2 for encoder-based fine-tuning
-                    if self.tracking_state == TrackingState::L1 {
-                        log::info!("Angle offset <= 5°, transitioning to L2 for encoder-based fine-tuning");
-                        self.tracking_state = TrackingState::L2;
-                    }
-                }
-                
-                // If angle is very close (<= 1°), we're done
-                if angle_offset.abs() <= 1.0 && self.tracking_state == TrackingState::L1 {
-                    let _ = self.relay.set_low().unwrap_or_default();
-                    return true;
-                }
+            // Log encoder status periodically
+            let (enc_a, enc_b, enc_state, enc_count) = self.get_encoder_status();
+            log::info!("Encoder status: A={}, B={}, state={:02b}, count={}", 
+                      enc_a, enc_b, enc_state, enc_count);
+            if angle_offset.abs() > 5.0 {
+                self.relay.set_high().unwrap_or_default();
+                self.tracking_state = TrackingState::L1;
+            }
+            if angle_offset.abs() <= 5.0 && self.tracking_state == TrackingState::L1 {
+                let _ = self.relay.set_low().unwrap_or_default();
+                return true; // New line
+                //self.tracking_state = TrackingState::L2;
             }
             match self.tracking_state {
                 TrackingState::L1 => {

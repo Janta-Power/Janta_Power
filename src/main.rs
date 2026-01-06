@@ -254,6 +254,8 @@ fn main() -> anyhow::Result<()> {
         peripherals.pins.gpio16,   // CW Motor
         peripherals.pins.gpio17,   // Relay
         peripherals.pins.gpio14,   // Limit Switch
+        peripherals.pins.gpio21,   // Encoder A
+        peripherals.pins.gpio47,   // Encoder B
     );
     
     motion.init();
@@ -304,13 +306,6 @@ fn main() -> anyhow::Result<()> {
 
      
     // MAIN TRACKING LOOP
-    
-    // ============================================================================
-    // TRACKING MODE FLAG
-    // ============================================================================
-    // Set to true to use legacy L1 tracking method (step-based)
-    // Set to false (default) to use modern L2 tracking method (encoder-based)
-    let use_legacy_l1_tracking = false;  // Change to true to enable legacy L1 tracking
 
     loop {
         let st_now = SystemTime::now();
@@ -335,7 +330,6 @@ fn main() -> anyhow::Result<()> {
             &mut nvs,
             &mut wifi,
             current_datetime.clone(),
-            use_legacy_l1_tracking,  // Pass the legacy flag
         );
 
         if !tracking_done {

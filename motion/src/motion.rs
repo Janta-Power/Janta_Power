@@ -208,7 +208,7 @@ impl Motion<'_> {
     /// Check for stall condition (encoder not changing while stepper is moving)
     fn check_stall(&mut self) -> bool {
         let enc_now = self.read_encoder();
-        let step_speed = self.motor.speed(); // steps/sec (actual ramped speed)
+        let step_speed = self.motor.speed(); // steps/sec (actual ramped speed) - returns f32
         let stepper_trying_to_move = step_speed.abs() > 1.0;
         
         if stepper_trying_to_move {
@@ -259,8 +259,8 @@ impl Motion<'_> {
         // Enable motor and configure
         self.relay.set_high().unwrap_or_default();
         self.motor.set_current_position(0);
-        self.motor.set_max_speed(max_speed_steps_per_sec);
-        self.motor.set_acceleration(self.acceleration as f64);
+        self.motor.set_max_speed(max_speed_steps_per_sec as f32);
+        self.motor.set_acceleration(self.acceleration as f32);
         self.motor.move_to(overshoot_steps);
         
         self.encoder_stop_armed = true;
@@ -411,12 +411,13 @@ impl Motion<'_> {
         &mut self,
         clock: &mut Clock<I2C>,
         location: f32,
-        balance: i32,
+        _balance: i32,  // Currently unused in L2, kept for API compatibility
         mqtt: &mut Mqtt,
         current_version: Version,
         nvs: &mut EspNvs<T>,
         wifi: &mut Wifi<'_>,
         formatted_time: String,
+        use_legacy_l1_tracking: bool,  // Flag to override: true = use L1 (legacy), false = use L2 (default)
     ) -> bool {
         self.update_position(location);
         log::info!("{},", clock.after_sunrise());
@@ -436,14 +437,39 @@ impl Motion<'_> {
             log::info!("Actual Location: {}", location);
             log::info!("Angle Offset: {}", angle_offset);
             log::info!("Sun Angle: {}", sun.azimuth_in_deg());
-            if angle_offset.abs() > 5.0 {
-                self.relay.set_high().unwrap_or_default();
-                self.tracking_state = TrackingState::L1;
-            }
-            if angle_offset.abs() <= 5.0 && self.tracking_state == TrackingState::L1 {
-                let _ = self.relay.set_low().unwrap_or_default();
-                return true; // New line
-                //self.tracking_state = TrackingState::L2;
+            log::info!("Tracking mode: {}", if use_legacy_l1_tracking { "L1 (Legacy)" } else { "L2 (Encoder-based)" });
+            
+            // State management based on tracking mode flag
+            if use_legacy_l1_tracking {
+                // LEGACY MODE: Use L1 (step-based) tracking
+                if angle_offset.abs() > 5.0 {
+                    self.relay.set_high().unwrap_or_default();
+                    self.tracking_state = TrackingState::L1;
+                }
+                // If angle is very close (<= 1°), we're done (legacy behavior)
+                if angle_offset.abs() <= 1.0 && self.tracking_state == TrackingState::L1 {
+                    let _ = self.relay.set_low().unwrap_or_default();
+                    return true;
+                }
+            } else {
+                // MODERN MODE: Use L2 (encoder-based) tracking by default
+                if angle_offset.abs() > 5.0 {
+                    // Large offset: use L1 for coarse movement first
+                    self.relay.set_high().unwrap_or_default();
+                    self.tracking_state = TrackingState::L1;
+                } else if angle_offset.abs() <= 5.0 {
+                    // Small offset: use L2 for encoder-based fine-tuning
+                    if self.tracking_state == TrackingState::L1 {
+                        log::info!("Angle offset <= 5°, transitioning to L2 for encoder-based fine-tuning");
+                        self.tracking_state = TrackingState::L2;
+                    }
+                }
+                
+                // If angle is very close (<= 1°), we're done
+                if angle_offset.abs() <= 1.0 && self.tracking_state == TrackingState::L1 {
+                    let _ = self.relay.set_low().unwrap_or_default();
+                    return true;
+                }
             }
             match self.tracking_state {
                 TrackingState::L1 => {

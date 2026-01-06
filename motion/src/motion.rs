@@ -259,8 +259,8 @@ impl Motion<'_> {
         // Enable motor and configure
         self.relay.set_high().unwrap_or_default();
         self.motor.set_current_position(0);
-        self.motor.set_max_speed(max_speed_steps_per_sec);
-        self.motor.set_acceleration(self.acceleration as f64);
+        self.motor.set_max_speed(max_speed_steps_per_sec as f32);
+        self.motor.set_acceleration(self.acceleration as f32);
         self.motor.move_to(overshoot_steps);
         
         self.encoder_stop_armed = true;
@@ -351,7 +351,7 @@ impl Motion<'_> {
         log::info!("Now, looking for the limit switch");
 
         let mut max_steps = calculate_steps(-360.0);
-        while (max_steps < 0 && self.lmsw.is_high()) {
+        while max_steps < 0 && self.lmsw.is_high() {
             let step_movement = calculate_steps(-1.0);
             self.move_by(step_movement);
             max_steps -= step_movement;
@@ -379,8 +379,8 @@ impl Motion<'_> {
         log::info!("Move 15 Degress clockwise first");
         self.relay.set_high().unwrap_or_default();
 
-        let correction_factor = 1.231;
-        let steps = (15.0 / -360.0) * (25600.0 * 50.0 * 84.0) * correction_factor;
+        let _correction_factor = 1.231;
+        let steps = (15.0 / -360.0) * (25600.0 * 50.0 * 84.0) * _correction_factor;
         log::info!("Steps Needed: {}", steps);
         log::info!("Steps Needed: {}", steps as i64);
         self.move_by(steps as i64);
@@ -389,7 +389,7 @@ impl Motion<'_> {
         log::info!("Now, looking for the limit switch");
 
         let mut max_steps = calculate_steps(360.0); // full CW
-        while (max_steps > 0 && self.lmsw.is_high()) {
+        while max_steps > 0 && self.lmsw.is_high() {
             let step_movement = calculate_steps(1.0); // Move 1 deg at a time
             self.move_by(step_movement);
             max_steps -= step_movement;
@@ -411,7 +411,7 @@ impl Motion<'_> {
         &mut self,
         clock: &mut Clock<I2C>,
         location: f32,
-        balance: i32,
+        _balance: i32,
         mqtt: &mut Mqtt,
         current_version: Version,
         nvs: &mut EspNvs<T>,
@@ -447,9 +447,9 @@ impl Motion<'_> {
             }
             match self.tracking_state {
                 TrackingState::L1 => {
-                    let correction_factor = 1.3;
+                    let _correction_factor = 1.3;
                     log::info!("Tracking state L1");
-                    let steps = (angle_offset / 360.0) * (25600.0 * 50.0 * 84.0); // * correction_factor; // Change to -360 for waco 
+                    let steps = (angle_offset / 360.0) * (25600.0 * 50.0 * 84.0); // * _correction_factor; // Change to -360 for waco 
                     log::info!("Steps Needed: {}", steps as i64);
                     self.move_by(steps as i64);
                     self.run();    // Blocking 

@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
 
      
     //CREDENTIALS CONFIGURATION 
-    todo!("Implement a .env");
+    // todo!("Implement a .env");
     
     let mqtt_user = "device1A";
     match nvs.set_str("mqtt_user", mqtt_user) {
@@ -285,7 +285,7 @@ fn main() -> anyhow::Result<()> {
 
      
     // HOMING SEQUENCE
-    todo!("Implement an encoder to re-position in case of power failure");
+    // todo!("Implement an encoder to re-position in case of power failure");
 
     let limit_sw_status = motion.find_limit_switch_cw();
     match limit_sw_status {

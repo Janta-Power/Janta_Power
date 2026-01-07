@@ -1,13 +1,635 @@
-// ============================================================================
-// MOTION MODULE - PUBLIC API
-// ============================================================================
-// This file defines the public interface for the motion module.
-// All implementation details are in motion.rs
-// State definitions are in states.rs
+pub mod motion {
+    use accel_stepper::{Driver, OperatingSystemClock, StepAndDirection};
+    use astronav::coords::noaa_sun::NOAASun;
+    use clock::Clock;
+    use std::time::{Duration, Instant};
+    use esp_idf_svc::hal::gpio::{
+        Gpio15, Gpio16, Gpio17, Gpio14, Gpio47, Gpio21, Input, Output, PinDriver
+    };
+    use esp_idf_svc::nvs::*;
+    use network::mqtt::Mqtt;
+    use wifi::wifi::{Wifi, WifiState};
+    use ota::OtaUpdater;
+    use semver::Version;
+    use std::{thread, panic};
 
-mod states;
-mod motion;
+    //Encoder pins 21,47 
 
-// Re-export the public API
+    
+    // Encoder configuration
+    const ENCODER_COUNTS_PER_REV: i64 = 348_323;
+    const NVS_KEY_LAST_ENCODER: &str = "last_enc_cnt";
+
+    // Quadrature decode table (robust, no branching)
+    static QUAD_TABLE: [i8; 16] = [
+         0, -1,  1,  0,
+         1,  0,  0, -1,
+        -1,  0,  0,  1,
+         0,  1, -1,  0,
+    ];
+
+    #[derive(PartialEq)]
+    enum TrackingState {
+        L1,
+        L2,
+        L3,
+    }
+
+    pub fn calculate_steps(offset: f32) -> i64 {
+        return ((offset / 360.0) * (25600.0 * 50.0 * 84.0)) as i64;
+        //return ((offset / 360.0) * (25600.0 * 50.0 *  84.0)) as i64;
+    }
+
+    pub struct Motion<'a> {
+        location: f32,
+        tracking_state: TrackingState,
+        speed: f32,
+        acceleration: u16,
+        motor: Driver,
+        motor_device:
+            StepAndDirection<PinDriver<'a, Gpio15, Output>, PinDriver<'a, Gpio16, Output>>,
+        motor_clock: OperatingSystemClock,
+        prev_balance: i32,
+        relay: PinDriver<'a, Gpio17, Output>,
+        lmsw: PinDriver<'a, Gpio14, Input>,
+
+        // Encoder inputs + state
+        enc_a: PinDriver<'a, Gpio47, Input>,
+        enc_b: PinDriver<'a, Gpio21, Input>,
+        encoder_count: i64,
+        last_ab: u8,
+        
+
+        // Encoder NVS persistence
+        encoder_loaded_from_nvs: bool,
+        last_encoder_persist: Instant,
+    }
+
+    // CW: direction
+    // CCW: step
+    impl Motion<'_> {
+        // NOTE: only signature change is adding enc_a + enc_b pins
+        pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14, enc_a: Gpio47, enc_b: Gpio21) -> Motion<'a> {
+            let step = PinDriver::output(p10).unwrap();
+            let direction = PinDriver::output(p11).unwrap();
+            let relay = PinDriver::output(p7).unwrap();
+            let mut lmsw = PinDriver::input(p6).unwrap();
+            lmsw.set_pull(esp_idf_svc::hal::gpio::Pull::Down).unwrap_or_default();
+            //lmsw.set_pull(esp_idf_svc::hal::gpio::Pull::Up)
+            //    .unwrap_or_default();
+
+            // Encoder pins (use pull-ups like Arduino INPUT_PULLUP)
+            let mut enc_a = PinDriver::input(enc_a).unwrap();
+            let mut enc_b = PinDriver::input(enc_b).unwrap();
+            enc_a.set_pull(esp_idf_svc::hal::gpio::Pull::Up).unwrap_or_default();
+            enc_b.set_pull(esp_idf_svc::hal::gpio::Pull::Up).unwrap_or_default();
+
+            let mut m = Motion {
+                location: 0.0,
+                tracking_state: TrackingState::L1,
+                speed: 43000.0, // was 43000.0
+                acceleration: 3000, //20000
+                motor: Driver::new(),
+                motor_device: StepAndDirection::new(step, direction),
+                motor_clock: OperatingSystemClock::new(),
+                prev_balance: 0,
+                relay,
+                lmsw,
+
+                enc_a,
+                enc_b,
+                encoder_count: 0,
+                last_ab: 0,
+
+                encoder_loaded_from_nvs: false,
+                last_encoder_persist: Instant::now(),
+            };
+
+            // Initialize last_ab from current encoder pin states
+            m.last_ab = ((m.enc_a.is_high() as u8) << 1) | (m.enc_b.is_high() as u8);
+
+            m
+        }
+
+        // Encoder helpers
+        fn read_encoder(&mut self) {
+            // A in bit1, B in bit0 (same layout as your Arduino sketch)
+            let ab: u8 = ((self.enc_a.is_high() as u8) << 1) | (self.enc_b.is_high() as u8);
+            if ab != self.last_ab {
+                let idx = ((self.last_ab << 2) | ab) as usize;
+                let delta = QUAD_TABLE[idx] as i64;
+                self.encoder_count += delta;
+                self.last_ab = ab;
+            }
+        }
+        
+        // Diagnostic: Check if encoder pins are actually changing
+        pub fn encoder_pin_states(&self) -> (bool, bool) {
+            (self.enc_a.is_high(), self.enc_b.is_high())
+        }
+
+        pub fn encoder_count(&self) -> i64 {
+            self.encoder_count
+        }
+
+        pub fn encoder_degrees(&self) -> f32 {
+            (self.encoder_count as f32) * (360.0 / ENCODER_COUNTS_PER_REV as f32)
+        }
+
+        pub fn reset_encoder(&mut self) {
+            self.encoder_count = 0;
+            self.last_ab = ((self.enc_a.is_high() as u8) << 1) | (self.enc_b.is_high() as u8);
+        }
+
+        fn load_encoder_from_nvs<T: NvsPartitionId>(&mut self, nvs: &mut EspNvs<T>) {
+            if self.encoder_loaded_from_nvs {
+                return;
+            }
+
+            match nvs.get_i64(NVS_KEY_LAST_ENCODER) {
+                Ok(Some(v)) => {
+                    self.encoder_count = v;
+                    log::info!("Loaded encoder_count={} from NVS", v);
+                }
+                Ok(None) => {
+                    log::info!("No stored encoder_count in NVS yet");
+                }
+                Err(e) => {
+                    log::error!("Failed to read encoder_count from NVS: {:?}", e);
+                }
+            }
+
+            self.encoder_loaded_from_nvs = true;
+            self.last_encoder_persist = Instant::now();
+        }
+
+        fn persist_encoder_to_nvs<T: NvsPartitionId>(&mut self, nvs: &mut EspNvs<T>) {
+            // Rate-limit writes to reduce flash wear
+            if self.last_encoder_persist.elapsed() < Duration::from_secs(1) {
+                return;
+            }
+
+            let v = self.encoder_count;
+            if let Err(e) = nvs.set_i64(NVS_KEY_LAST_ENCODER, v) {
+                log::error!("Failed to write encoder_count to NVS: {:?}", e);
+                return;
+            }
+
+            self.last_encoder_persist = Instant::now();
+        }
+
+        pub fn update_position(&mut self, location: f32) {
+            self.location = location;
+        }
+
+        pub fn location(&mut self) -> f32 {
+            self.location
+        }
+
+        pub fn switch_pressed(&mut self) -> bool {
+            self.lmsw.is_low()
+        }
+
+        pub fn init(&mut self) {
+            self.motor.set_max_speed(self.speed);
+            //self.motor.set_max_speed(10.0);
+            self.motor.set_speed(self.speed);
+            self.motor.set_acceleration(self.acceleration.into());
+        }
+
+        pub fn move_by_angle(&mut self, offset: f32) {
+            self.move_by(calculate_steps(offset));
+            //self.run();
+        }
+
+        pub fn move_by(&mut self, location: i64) {
+            self.motor.move_by(location);
+            self.run();
+        }
+
+        /// Moves the tracker to 90 degrees (home), enabling relay before moving and disabling it after.
+        /// Uses the shortest path (CW or CCW) based on current position.
+        pub fn move_to_60(&mut self) {
+            let current = self.location();
+            let offset = 60.0 - current;
+            log::info!("Moving from {:.2}° to 150°, offset = {:.2}°", current, offset);
+
+            // Turn ON relay to enable motor movement
+            self.relay.set_high().unwrap_or_default();
+
+            // Move by calculated angle
+            self.move_by_angle(offset);
+            self.run();
+
+            // Update internal position
+            self.update_position(60.0);
+
+            // Turn OFF relay after movement for safety/power savings
+            self.relay.set_low().unwrap_or_default();
+
+            log::info!("Now at 150°");
+        }
+
+        pub fn move_test(&mut self, location: i64) {
+            self.relay.set_high().unwrap_or_default(); // Turn on relay
+            self.tracking_state = TrackingState::L1; //  Change tracking state
+
+            match self.tracking_state {
+                TrackingState::L1 => {
+                    //let steps = (location / 360) * (20000 * 50 * 84);
+                    let steps = (location / 360) * (25600 * 50 * 84);
+                    log::info!("Steps Needed: {}", steps);
+                    log::info!("Steps Needed: {}", steps as i64);
+                    self.move_by(steps as i64);
+                    self.run();
+                    self.relay.set_low().unwrap_or_default(); // Turn on relay
+                    // self.update_position((location as f64 + angle_offset) as f32);
+                    //return false;
+                }
+                TrackingState::L2 => {
+                    log::info!("L2: The encoder based movement");
+                    let required_ticks = (location / 360) * ENCODER_COUNTS_PER_REV;
+                    log::info!("Ticks Needed: {}", required_ticks);
+                    
+                }
+
+                TrackingState::L3 => (),
+            }
+        }
+
+        pub fn run(&mut self) {
+    let mut t0 = Instant::now();
+    let mut encoder_reads = 0u64;
+    let mut encoder_changes = 0u64;
+
+    loop {
+        if self.motor.is_running() {
+            // ULTRA-TIGHT LOOP: Read encoder as the primary activity
+            // For 348k counts/rev encoder, we need maximum polling frequency
+            // Read encoder multiple times before each motor poll
+            for _ in 0..20 {
+                let old_count = self.encoder_count;
+                self.read_encoder();
+                encoder_reads += 1;
+                if self.encoder_count != old_count {
+                    encoder_changes += 1;
+                }
+            }
+            
+            // Poll motor (must be called frequently, but encoder is priority)
+            let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
+            
+            // Read encoder again after motor poll
+            for _ in 0..20 {
+                let old_count = self.encoder_count;
+                self.read_encoder();
+                encoder_reads += 1;
+                if self.encoder_count != old_count {
+                    encoder_changes += 1;
+                }
+            }
+
+            // Print debug every 100ms
+            if t0.elapsed() >= Duration::from_millis(100) {
+                let (enc_a_state, enc_b_state) = self.encoder_pin_states();
+                let step_pos = self.motor.current_position();
+                let step_rem = self.motor.distance_to_go();
+
+                log::info!(
+                    "Stepper pos: {} | Step rem: {} | Enc cnt: {} | Enc deg: {:.2} | Enc reads: {} | Enc changes: {} | Pins: A={} B={}",
+                    step_pos,
+                    step_rem,
+                    self.encoder_count(),
+                    self.encoder_degrees(),
+                    encoder_reads,
+                    encoder_changes,
+                    enc_a_state,
+                    enc_b_state
+                );
+                
+                // Reset counters for next interval
+                encoder_reads = 0;
+                encoder_changes = 0;
+                t0 = Instant::now();
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Final summary after move completes
+    let step_pos = self.motor.current_position();
+    let step_rem = self.motor.distance_to_go();
+
+    log::info!(
+        "MOVE COMPLETE | Stepper pos: {} | Step rem: {} | Enc cnt: {} | Enc deg: {:.2}",
+        step_pos,
+        step_rem,
+        self.encoder_count(),
+        self.encoder_degrees()
+    );
+}
+
+        pub fn flip_relay(&mut self) {
+            self.relay.toggle().unwrap_or_default();
+        }
+
+        pub fn find_limit_switch_cw(&mut self) -> bool {
+            if self.lmsw.is_low() {
+                //if self.lmsw.is_high() {
+                log::info!("Found Limit Switch, Heading : 90");
+                self.update_position(90.0);
+                return true;
+            }
+
+            log::info!("Move 15 Degrees clockwise first");
+            self.relay.set_high().unwrap_or_default();
+
+            let correction_factor = 1.231;
+            //let steps = (15.0 / 360.0) * (800.0 * 50.0 * 84.0) * correction_factor;
+            // steps = (angle offeset / 360.0) * (microstepping * stool bearing)
+            let steps = (15.0 / 360.0) * (25600.0 * 50.0 * 84.0); // correction_factor;
+            log::info!("Steps Needed: {}", steps);
+            log::info!("Steps Needed: {}", steps as i64);
+            self.move_by(steps as i64);
+            self.run(); // Blocking
+            log::info!("Done moving 15 Degress clockwise");
+
+            log::info!("Now, looking for the limit switch");
+
+            let mut max_steps = calculate_steps(-360.0);
+            while (max_steps < 0 && self.lmsw.is_high()) {
+                //while (max_steps < 0 && self.lmsw.is_low()) {
+                let step_movement = calculate_steps(-1.0);
+                self.move_by(step_movement);
+                max_steps -= step_movement;
+            }
+
+            self.relay.set_low().unwrap_or_default();
+            if max_steps < 0 {
+                log::info!("Found Limit Switch, Heading : 90");
+                self.update_position(90.0);
+                self.relay.set_low().unwrap_or_default();
+                return true;
+            }
+            log::error!("Limit Switch was not found!");
+            return false;
+        }
+
+        pub fn find_limit_switch_ccw(&mut self) -> bool {
+            if self.lmsw.is_low() {
+                self.update_position(90.0);
+                return true;
+            }
+
+            log::info!("Move 15 Degrees clockwise first");
+            self.relay.set_high().unwrap_or_default();
+
+            let correction_factor = 1.231;
+            //let steps = (15.0 / -360.0) * (20000.0 * 50.0 * 84.0) * correction_factor;
+            let steps = (15.0 / -360.0) * (25600.0 * 50.0 * 84.0); //* correction_factor;
+            log::info!("Steps Needed: {}", steps);
+            log::info!("Steps Needed: {}", steps as i64);
+            self.move_by(steps as i64);
+            self.run(); // Blocking
+            log::info!("Done moving 15 Degress clockwise");
+            log::info!("Now, looking for the limit switch");
+
+            let mut max_steps = calculate_steps(360.0); // full CW
+            while (max_steps > 0 && self.lmsw.is_high()) {
+                let step_movement = calculate_steps(1.0); // Move 1 deg at a time
+                self.move_by(step_movement);
+                max_steps -= step_movement;
+            }
+
+            self.relay.set_low().unwrap_or_default();
+
+            if max_steps > 0 {
+                self.update_position(90.0);
+                self.relay.set_low().unwrap_or_default();
+                return true;
+            }
+            false
+        }
+
+        pub fn set_tower_position<I2C: embedded_hal::i2c::I2c, T: NvsPartitionId>(
+            &mut self,
+            clock: &mut Clock<I2C>,
+            location: f32,
+            balance: i32,
+            mqtt: &mut Mqtt,
+            current_version: Version,
+            nvs: &mut EspNvs<T>,
+            wifi: &mut Wifi<'_>,
+        ) -> bool {
+            // Load encoder count once per boot
+            self.load_encoder_from_nvs(nvs);
+
+            self.update_position(location);
+            log::info!("{},", clock.after_sunrise());
+
+            if clock.after_sunrise() && !clock.after_sunset() {
+                let sun = NOAASun {
+                    year: clock.get_year(),
+                    doy: clock.get_day() as u16,
+                    long: clock.get_longitude() as f32,
+                    lat: clock.get_latitude() as f32,
+                    timezone: -5.0,
+                    hour: clock.get_hour(),
+                    min: clock.get_minutes(),
+                    sec: clock.get_seconds(),
+                };
+                log::info!("Tracking in progress");
+                let angle_offset = sun.azimuth_in_deg() - (location as f64);
+                log::info!("Actual Location: {}", location);
+                log::info!("Angle Offset: {}", angle_offset);
+                log::info!("Sun Angle: {}", sun.azimuth_in_deg());
+
+                if angle_offset.abs() > 5.0 {
+                    self.relay.set_high().unwrap_or_default();
+                    self.tracking_state = TrackingState::L1;
+                }
+                if angle_offset.abs() <= 5.0 && self.tracking_state == TrackingState::L1 {
+                    let _ = self.relay.set_low().unwrap_or_default();
+                    return true; // New line
+                                   //self.tracking_state = TrackingState::L2;
+                }
+
+                match self.tracking_state {
+                    TrackingState::L1 => {
+                        let correction_factor = 1.231;
+                        log::info!("Tracking state L1");
+                        //let steps = (angle_offset / 360.0) * (20000.0 * 50.0 * 84.0) * correction_factor; // Change to -360 for waco
+                        let steps =
+                            (angle_offset / 360.0) * (25600.0 * 50.0 * 84.0); //* correction_factor; // Change to -360 for waco
+                        log::info!("Steps Needed: {}", steps as i64);
+                        self.move_by(steps as i64);
+                        self.run(); // Blocking
+                                    // log::info!("Angle Offset: {}", angle_offset);
+                        self.update_position((location as f64 + angle_offset) as f32);
+                        log::info!("Exiting Tracking state L1");
+                        self.relay.set_low().unwrap_or_default(); // New line
+
+                        // Persist encoder after motion (rate-limited)
+                        self.persist_encoder_to_nvs(nvs);
+
+                        //Publish message (now includes encoder values)
+                        let payload = format!(
+                            "Steps needed: {}, current tower angle: {}, encoder_count: {}, encoder_deg: {}",
+                            steps,
+                            location as f64 + angle_offset,
+                            self.encoder_count(),
+                            self.encoder_degrees()
+                        );
+                        match mqtt.publish("device1A/data", payload.as_bytes()) {
+                            Ok(_) => log::info!("Published data payload successfully"),
+                            Err(e) => log::error!("Failed to publish data payload: {:?}", e),
+                        }
+                        return false;
+                    }
+                    TrackingState::L2 => {
+                        log::info!("Tracking state L2");
+                        if angle_offset.abs() > 5.0 {
+                            self.prev_balance = 0;
+                            self.tracking_state = TrackingState::L1;
+                            return false;
+                        }
+                        if (balance - self.prev_balance).abs() < 75 {
+                            self.prev_balance = 0;
+                            self.tracking_state = TrackingState::L1;
+                            return true;
+                        } else {
+                            self.prev_balance = balance;
+                        }
+                        if balance <= -10 {
+                            let steps = (-0.5 / 360.0) * (20000.0 * 50.0 * 84.0);
+                            self.move_by(steps as i64);
+                            self.run();
+                            self.update_position(location - 0.5);
+
+                            self.persist_encoder_to_nvs(nvs);
+
+                            return false;
+                        } else if balance >= 10 {
+                            let steps = (0.5 / 360.0) * (20000.0 * 50.0 * 84.0);
+                            self.move_by(steps as i64);
+                            self.run();
+                            self.update_position(location + 0.5);
+
+                            self.persist_encoder_to_nvs(nvs);
+
+                            return false;
+                        } else {
+                            self.prev_balance = 0;
+                            self.tracking_state = TrackingState::L1;
+                            return true;
+                        }
+                    }
+                    TrackingState::L3 => (), // Future tracking
+                }
+            } else {
+                // Sunset Operation
+                if location == 90.0 {
+                    log::info!("Already reached sleep position");
+
+                    // Track start time
+                    let mut last_check = Instant::now();
+                    let check_interval = Duration::from_secs(2 * 60 * 60); // 2 hours
+
+                    // Wait here until sunrise
+                    while clock.after_sunset() || !clock.after_sunrise() {
+                        if clock.after_sunrise() && !clock.after_sunset() {
+                            log::info!("Sunrise detected, exiting sleep loop");
+                            break;
+                        }
+                        if last_check.elapsed() >= check_interval {
+                            log::info!("2 hours elapsed, checking for OTA");
+
+                            // Check to see if wifi is disconnected before OTA try
+                            log::info!("Current wifi state: {:?}", wifi.state());
+                            if wifi.state() == WifiState::Disconnected {
+                                wifi.reconnect_if_disconnected();
+                            }
+
+                            // Creates an instance of OTA crate and runs version compare
+                            thread::sleep(Duration::from_secs(3));
+                            let mut updater = OtaUpdater::new_ota(
+                                current_version.clone(),
+                                mqtt,
+                                Some("device1A"),
+                                Some("device1A"),
+                            )
+                            .expect("Failed to create OTA udater instance");
+
+                            thread::sleep(Duration::from_secs(3));
+                            let run_compare = updater.run_version_compare(nvs);
+
+                            match run_compare {
+                                Ok(_) => log::info!("Version compare succeeded"),
+                                Err(e) => {
+                                    log::error!("Version compare failed: {:?}", e);
+                                }
+                            }
+
+                            last_check = Instant::now(); // reset the timer
+                                                     //break;
+                        }
+                        log::info!("Still waiting for sunrise...");
+                        std::thread::sleep(std::time::Duration::from_secs(600)); // Prevent busy waiting
+                    }
+
+                    return true;
+                } else {
+                    log::info!("Moving to sleep position...");
+                    let limit_sw_status = self.find_limit_switch_cw(); // change to ccw for waco
+                    match limit_sw_status {
+                        true => log::info!("Limit switch has returned true"),
+                        false => {
+                            log::error!(
+                                "Limit switch has returned false, limit switch could not be found"
+                            );
+                            loop {
+                                if let Err(e) = mqtt.publish(
+                                    "device1A/tower/status",
+                                    b"Critical failure: Limit switch failure!",
+                                ) {
+                                    log::error!("Failed to publish critical error message: {:?}", e);
+                                }
+                                thread::sleep(Duration::from_secs(900)); // Loop every 15 minutes
+                            }
+                        }
+                    }
+
+                    // Persist encoder after reaching sleep move attempt
+                    self.persist_encoder_to_nvs(nvs);
+
+                    log::info!("Tower has reached sleep position");
+                    return false;
+                }
+            }
+            true
+
+            /*else if clock.after_sunset() {
+                 if self.tracking_state != TrackingState::L3 {
+                    let angle_offset = 90.0 - location;
+                    let steps = (angle_offset / 360.0) * (20000.0 * 50.0 * 84.0);
+                    log::info!("Steps Needed: {}", steps);
+                    log::info!("Steps Needed: {}", steps as i64);
+                    self.move_by(steps as i64);
+                    self.relay.set_high().unwrap_or_default();
+                    self.run();
+                    self.relay.set_low().unwrap_or_default();
+                    self.update_position(90.0);
+                    self.tracking_state = TrackingState::L3;
+                    return true;
+
+
+                }
+            }
+            true
+            */
+        }
+    }
+}
+
 pub use motion::Motion;
-pub use states::TrackingState;

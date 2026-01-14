@@ -152,7 +152,7 @@ pub mod motion {
                     let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
                     self.encoder.poll();
                     
-                    if t0.elapsed() >= Duration::from_secs(1) {
+                    if t0.elapsed() >= Duration::from_millis(100) {
                         let position = self.encoder.position();
                         let step_pos = self.motor.current_position();
                         let step_rem = self.motor.distance_to_go();

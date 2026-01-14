@@ -19,5 +19,6 @@ clock = { path = "../clock" }
 network = { path = "../network" }
 ota = { path = "../ota" }      
 wifi = { path = "../wifi" }            #New
+quadrature-encoder = { version = "0.2.1", default-features = false }
 
 

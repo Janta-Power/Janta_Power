@@ -3,16 +3,14 @@ pub mod motion {
     use astronav::coords::noaa_sun::NOAASun;
     use clock::Clock;
     use std::time::{Duration, Instant};
-    use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Input, Output, PinDriver};
+    use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Gpio47, Gpio21, Input, Output, PinDriver};
+    use quadrature_encoder::{IncrementalEncoder, Rotary, HalfStep};
     use esp_idf_svc::nvs::*;
     use network::mqtt::Mqtt;
     use wifi::wifi::{Wifi, WifiState};
     use ota::OtaUpdater;
     use semver::Version;
     use std::{thread, panic};
-
-
-
 
     #[derive(PartialEq)]
     enum TrackingState {
@@ -37,18 +35,23 @@ pub mod motion {
         prev_balance: i32,
         relay: PinDriver<'a, Gpio17, Output>,
         lmsw: PinDriver<'a, Gpio14, Input>,
+        encoder: IncrementalEncoder<Rotary, PinDriver<'a, Gpio47, Input>, PinDriver<'a, Gpio21, Input>, HalfStep>,
     }
 
     // CW: direction
     // CCW: step
     impl Motion<'_> {
-        pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14) -> Motion<'a> {
+        pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14, p47: Gpio47, p21: Gpio21) -> Motion<'a> {
             let step = PinDriver::output(p10).unwrap();
             let direction = PinDriver::output(p11).unwrap();
             let relay = PinDriver::output(p7).unwrap();
             let mut lmsw = PinDriver::input(p6).unwrap();
+            let encoderA = PinDriver::input(p47).unwrap();
+            let encoderB = PinDriver::input(p21).unwrap();
             lmsw.set_pull(esp_idf_svc::hal::gpio::Pull::Down)
                 .unwrap_or_default();
+
+            let encoder = IncrementalEncoder::<Rotary, _, _, HalfStep>::new(encoderA, encoderB);
 
             Motion {
                 location: 0.0,
@@ -61,6 +64,7 @@ pub mod motion {
                 prev_balance: 0,
                 relay,
                 lmsw,
+                encoder,
             }
         }
 
@@ -140,10 +144,22 @@ pub mod motion {
 
         }
 
+
         pub fn run(&mut self) {
+            let mut t0 = Instant::now();
             loop {
                 if self.motor.is_running() {
                     let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
+                    self.encoder.poll();
+                    
+                    if t0.elapsed() >= Duration::from_secs(1) {
+                        let position = self.encoder.position();
+                        let step_pos = self.motor.current_position();
+                        let step_rem = self.motor.distance_to_go();
+                        log::info!("Encoder Ticks: {}, Step Position: {}, Step Remaining: {}", position, step_pos, step_rem);
+                        t0 = Instant::now();
+                    }
+                    // log::info!("Encoder Position: {}", position);
                 } else {
                     break;
                 }

@@ -50,9 +50,11 @@ fn main() -> anyhow::Result<()> {
         Err(e) => panic!("Could't get namespace {:?}", e),
     };
 
-     
-    // I2C BUS SETUP
-    
+    // Encoder pins (move them once; pass into Motion::new later)
+    let encoderA = peripherals.pins.gpio47;
+    let encoderB = peripherals.pins.gpio21;
+
+    // Setting of sda and scl gpio pins as well as i2c
     let sda = peripherals.pins.gpio8;
     let scl = peripherals.pins.gpio9;
     let config = I2cConfig::new().baudrate(10_u32.kHz().into());
@@ -107,9 +109,11 @@ fn main() -> anyhow::Result<()> {
         .to_string();
 
     let mut wifi = Wifi::new(peripherals.modem, sysloop.clone(), nvs_default)?;
-    wifi.connect(&real_wifi_ssid, &real_wifi_pass).expect("Wi-Fi connection failed");
-    info!("Current wifi state: {:?}", wifi.state());
-    if wifi.state() == WifiState::Disconnected {
+    log::info!("Waiting for 20 seconds before connecting to wifi");
+    thread::sleep(Duration::from_secs(20));
+	wifi.connect(&real_wifi_ssid, &real_wifi_pass).expect("Wi-Fi connection failed");
+	info!("Current wifi state: {:?}", wifi.state());
+    if wifi.state() == WifiState::Disconnected{
         wifi.reconnect_if_disconnected()?;
     }
 
@@ -252,8 +256,10 @@ fn main() -> anyhow::Result<()> {
     let mut motion = Motion::new(
         peripherals.pins.gpio15,   // CCW Motor
         peripherals.pins.gpio16,   // CW Motor
-        peripherals.pins.gpio17,   // Relay
-        peripherals.pins.gpio14,   // Limit Switch
+        peripherals.pins.gpio17,   // Relay 
+        peripherals.pins.gpio14,   // Limit Switch 
+        encoderA,                  // Encoder A
+        encoderB,                  // Encoder B
     );
     
     motion.init();

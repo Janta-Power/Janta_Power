@@ -3,16 +3,14 @@ pub mod motion {
     use astronav::coords::noaa_sun::NOAASun;
     use clock::Clock;
     use std::time::{Duration, Instant};
-    use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Input, Output, PinDriver};
+    use esp_idf_svc::hal::gpio::{Gpio15, Gpio16, Gpio17, Gpio14, Gpio47, Gpio21, Input, Output, PinDriver};
+    use quadrature_encoder::{IncrementalEncoder, Rotary, HalfStep};
     use esp_idf_svc::nvs::*;
     use network::mqtt::Mqtt;
     use wifi::wifi::{Wifi, WifiState};
     use ota::OtaUpdater;
     use semver::Version;
     use std::{thread, panic};
-
-
-
 
     #[derive(PartialEq)]
     enum TrackingState {
@@ -37,19 +35,31 @@ pub mod motion {
         prev_balance: i32,
         relay: PinDriver<'a, Gpio17, Output>,
         lmsw: PinDriver<'a, Gpio14, Input>,
+        encoder: IncrementalEncoder<Rotary, PinDriver<'a, Gpio47, Input>, PinDriver<'a, Gpio21, Input>, HalfStep>,
+        // Encoder "reset" is implemented as a software offset: displayed_position = raw - offset.
+        encoder_zero_offset: i32,
+        // Limit-switch edge detection / debounce state (active-low switch).
+        lmsw_last_state_pressed: bool,
+        lmsw_last_change: Instant,
+        lmsw_zeroed_this_press: bool,
     }
 
     // CW: direction
     // CCW: step
     impl Motion<'_> {
-        pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14) -> Motion<'a> {
+        pub fn new<'a>(p10: Gpio15, p11: Gpio16, p7: Gpio17, p6: Gpio14, p47: Gpio47, p21: Gpio21) -> Motion<'a> {
             let step = PinDriver::output(p10).unwrap();
             let direction = PinDriver::output(p11).unwrap();
             let relay = PinDriver::output(p7).unwrap();
             let mut lmsw = PinDriver::input(p6).unwrap();
+            let encoderA = PinDriver::input(p47).unwrap();
+            let encoderB = PinDriver::input(p21).unwrap();
             lmsw.set_pull(esp_idf_svc::hal::gpio::Pull::Down)
                 .unwrap_or_default();
 
+            let encoder = IncrementalEncoder::<Rotary, _, _, HalfStep>::new(encoderA, encoderB);
+
+            let now = Instant::now();
             Motion {
                 location: 0.0,
                 tracking_state: TrackingState::L1,
@@ -61,6 +71,11 @@ pub mod motion {
                 prev_balance: 0,
                 relay,
                 lmsw,
+                encoder,
+                encoder_zero_offset: 0,
+                lmsw_last_state_pressed: false,
+                lmsw_last_change: now,
+                lmsw_zeroed_this_press: false,
             }
         }
 
@@ -88,6 +103,11 @@ pub mod motion {
         }
 
         pub fn move_by(&mut self, location: i64) {
+            self.motor.move_by(location);
+            self.run();
+        }
+
+        pub fn move_by_ticks(&mut self, location: i64) {
             self.motor.move_by(location);
             self.run();
         }
@@ -140,10 +160,50 @@ pub mod motion {
 
         }
 
+
         pub fn run(&mut self) {
+            let mut t0 = Instant::now();
             loop {
                 if self.motor.is_running() {
                     let _ = self.motor.poll(&mut self.motor_device, &self.motor_clock);
+                    self.encoder.poll();
+
+                    // Reset encoder count to 0 when the limit switch is pressed (edge-triggered + debounced).
+                    //
+                    // The switch is active-low in this codebase (pressed => is_low()).
+                    let pressed = self.lmsw.is_low();
+                    let now = Instant::now();
+                    if pressed != self.lmsw_last_state_pressed {
+                        self.lmsw_last_state_pressed = pressed;
+                        self.lmsw_last_change = now;
+                        // Allow re-zeroing after a release.
+                        if !pressed {
+                            self.lmsw_zeroed_this_press = false;
+                        }
+                    }
+
+                    // Simple time-based debounce: require stable pressed state for 30ms.
+                    if pressed
+                        && !self.lmsw_zeroed_this_press
+                        && self.lmsw_last_change.elapsed() >= Duration::from_millis(30)
+                    {
+                        self.encoder_zero_offset = self.encoder.position();
+                        self.lmsw_zeroed_this_press = true;
+                        log::info!("Limit switch pressed: encoder zeroed (offset={})", self.encoder_zero_offset);
+                    }
+                    
+                    if t0.elapsed() >= Duration::from_millis(100) {
+                        let position = self.encoder.position() - self.encoder_zero_offset;
+                        let step_pos = self.motor.current_position();
+                        let step_rem = self.motor.distance_to_go();
+                        log::info!(
+                            "Encoder Ticks: {}, Step Position: {}, Step Remaining: {}",
+                            position,
+                            step_pos,
+                            step_rem
+                        );
+                        t0 = Instant::now();
+                    }
                 } else {
                     break;
                 }

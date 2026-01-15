@@ -35,6 +35,21 @@ const MQTT_CLIENT_ID: &str = "device1A_pub";
 const DEFAULT_VERSION: &str = "1.0.4";
 const HEADING_TAG: &str = "heading";
 
+// ======== Encoder snapshot contract (Stage 0) ========
+// If you ever change meanings / units, bump this version and ignore old snapshots on boot.
+const ENC_SNAPSHOT_VERSION: u32 = 1;
+
+// NVS keys for resuming position after reboot (incremental encoder; tower is non-backdrivable).
+const NVS_KEY_ENC_SNAPSHOT_VERSION: &str = "enc_snapshot_v";
+const NVS_KEY_ENC_TICKS_ADJ: &str = "enc_ticks_adj";
+// Optional keys we may add later:
+// const NVS_KEY_ENC_ZERO_OFFSET: &str = "enc_zero_offset";
+// const NVS_KEY_SNAPSHOT_STATE: &str = "enc_snap_state";
+
+// Home (limit switch) tolerance band for "did we actually return to 0?"
+// This is ticks, in the adjusted coordinate system (0 at limit switch).
+const ENC_HOME_TOL_TICKS: i32 = 50;
+
 const DEFAULT_MQTT_USER: &str = "device1A";
 const DEFAULT_MQTT_PASS: &str = "device1A";
 const DEFAULT_WIFI_SSID: &str = "Power2";
@@ -360,6 +375,27 @@ fn main() -> anyhow::Result<()> {
             match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
                 Ok(_) => info!("Stored stable heading in NVS: {}", actual_heading),
                 Err(e) => warn!("Failed to store heading in NVS: {:?}", e),
+            }
+
+            // ======== Stage 2: persist encoder snapshot (non-backdrivable tower) ========
+            // Convention: adjusted ticks are 0 at the limit switch, CW positive.
+            let enc_ticks_adj = motion.encoder_ticks_adjusted();
+            if let Err(e) = nvs.set_u32(NVS_KEY_ENC_SNAPSHOT_VERSION, ENC_SNAPSHOT_VERSION) {
+                warn!(
+                    "Failed to store encoder snapshot version in NVS ({}): {:?}",
+                    NVS_KEY_ENC_SNAPSHOT_VERSION, e
+                );
+            }
+            if let Err(e) = nvs.set_i32(NVS_KEY_ENC_TICKS_ADJ, enc_ticks_adj) {
+                warn!(
+                    "Failed to store encoder ticks in NVS ({}): {:?}",
+                    NVS_KEY_ENC_TICKS_ADJ, e
+                );
+            } else {
+                info!(
+                    "Stored encoder snapshot in NVS: {}={} (v={})",
+                    NVS_KEY_ENC_TICKS_ADJ, enc_ticks_adj, ENC_SNAPSHOT_VERSION
+                );
             }
         } else {
             info!("True return from set tower position");

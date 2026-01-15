@@ -64,7 +64,7 @@ pub mod motion {
                 location: 0.0,
                 tracking_state: TrackingState::L1,
                 speed: 43000.0,
-                acceleration: 20000,
+                acceleration: 25600,
                 motor: Driver::new(),
                 motor_device: StepAndDirection::new(step, direction),
                 motor_clock: OperatingSystemClock::new(),
@@ -91,15 +91,25 @@ pub mod motion {
             self.lmsw.is_low()
         }
 
+        // Convention: CW is positive; 0 ticks corresponds to the limit switch (home) after zeroing.
+        pub fn encoder_ticks_adjusted(&self) -> i32 {
+            self.encoder.position() - self.encoder_zero_offset
+        }
+
+        // Raw encoder ticks from the quadrature decoder (typically resets to 0 on reboot).
+        pub fn encoder_ticks_raw(&self) -> i32 {
+            self.encoder.position()
+        }
+
+        // Stage 3: restore the software zero offset so adjusted ticks can be reconstructed after reboot.
+        pub fn set_encoder_zero_offset(&mut self, zero_offset: i32) {
+            self.encoder_zero_offset = zero_offset;
+        }
+
         pub fn init(&mut self) {
             self.motor.set_max_speed(self.speed);
             self.motor.set_speed(self.speed);
             self.motor.set_acceleration(self.acceleration.into());
-        }
-
-        pub fn move_by_angle(&mut self, offset: f32) {
-            self.move_by(calculate_steps(offset));
-            //self.run();
         }
 
         pub fn move_by(&mut self, location: i64) {
@@ -112,54 +122,6 @@ pub mod motion {
             self.run();
         }
         
-                /// Moves the tracker to 90 degrees (home), enabling relay before moving and disabling it after.
-        /// Uses the shortest path (CW or CCW) based on current position.
-        pub fn move_to_60(&mut self) {
-            let current = self.location();
-            let offset = 60.0 - current;
-            log::info!("Moving from {:.2}° to 150°, offset = {:.2}°", current, offset);
-
-            // Turn ON relay to enable motor movement
-            self.relay.set_high().unwrap_or_default();
-
-            // Move by calculated angle
-            self.move_by_angle(offset);
-            self.run();
-
-            // Update internal position
-            self.update_position(60.0);
-
-            // Turn OFF relay after movement for safety/power savings
-            self.relay.set_low().unwrap_or_default();
-
-            log::info!("Now at 150°");
-        }
-
-        pub fn move_test(&mut self, location: i64) {
-            self.relay.set_high().unwrap_or_default();  // Turn on relay 
-            self.tracking_state = TrackingState::L1;   //  Change tracking state
-
-            match self.tracking_state {
-                TrackingState::L1 => {
-                    let steps = (location / 360) * (25600 * 50 * 84);
-                    log::info!("Steps Needed: {}", steps);
-                    log::info!("Steps Needed: {}", steps as i64);
-                    self.move_by(steps as i64);
-                    self.run();
-                    self.relay.set_low().unwrap_or_default();  // Turn on relay 
-                       // self.update_position((location as f64 + angle_offset) as f32);
-                    //return false;
-                    
-                }
-                TrackingState::L2 => {
-                    log::info!("L2");
-                }
-
-                TrackingState::L3 => (),
-            }
-
-        }
-
 
         pub fn run(&mut self) {
             let mut t0 = Instant::now();
@@ -193,7 +155,7 @@ pub mod motion {
                     }
                     
                     if t0.elapsed() >= Duration::from_millis(100) {
-                        let position = self.encoder.position() - self.encoder_zero_offset;
+                        let position = self.encoder_ticks_adjusted();
                         let step_pos = self.motor.current_position();
                         let step_rem = self.motor.distance_to_go();
                         log::info!(
@@ -226,7 +188,7 @@ pub mod motion {
             self.relay.set_high().unwrap_or_default();
 
             let correction_factor = 1.231;
-            let steps = (15.0 / 360.0) * (25600.0 * 50.0 * 84.0); //* correction_factor;
+            let steps = (15.0 / 360.0) * (25600.0 * 50.0 * 84.0);
             log::info!("Steps Needed: {}", steps);
             log::info!("Steps Needed: {}", steps as i64);
             self.move_by(steps as i64);
@@ -265,7 +227,7 @@ pub mod motion {
             self.relay.set_high().unwrap_or_default();
 
             let correction_factor = 1.231;
-            let steps = (15.0 / -360.0) * (25600.0 * 50.0 * 84.0) * correction_factor;
+            let steps = (15.0 / -360.0) * (25600.0 * 50.0 * 84.0)
             log::info!("Steps Needed: {}", steps);
             log::info!("Steps Needed: {}", steps as i64);
             self.move_by(steps as i64);
@@ -415,7 +377,7 @@ pub mod motion {
 
                             // Creates an instance of OTA crate and runs version compare
                             thread::sleep(Duration::from_secs(3));
-                            let mut updater = OtaUpdater::new_ota(current_version.clone(), mqtt, Some("device1A"), Some("device1A")).expect("Failed to create OTA udater instance");
+                            let mut updater = OtaUpdater::new_ota(current_version.clone(), mqtt, Some("device1A"), Some("device1A")).expect("Failed to create OTA adapter instance");
 
                             thread::sleep(Duration::from_secs(3));
                             let run_compare = updater.run_version_compare(nvs);
@@ -455,7 +417,7 @@ pub mod motion {
                 }
             }
             true
-
+            //note to self: maybe remove?
             /*else if clock.after_sunset() {
                  if self.tracking_state != TrackingState::L3 {
                     let angle_offset = 90.0 - location;

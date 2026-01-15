@@ -39,6 +39,11 @@ use ota::OtaUpdater;
 use semver::Version;
 use wifi::wifi::{Wifi, WifiState};
 
+// Encoder save to NVS version
+const ENC_SNAPSHOT_VERSION: u32 = 1.02; //Keep updating this version when you change the encoder snapshot logic
+const NVS_KEY_ENC_SNAPSHOT_VERSION: &str = "enc_snapshot_v";
+const NVS_KEY_ENC_TICKS_ADJ: &str = "enc_ticks_adj";
+
 fn main() -> anyhow::Result<()> {
     // Required for ESP-IDF patches
     esp_idf_svc::sys::link_patches();
@@ -284,47 +289,79 @@ fn main() -> anyhow::Result<()> {
     led.display_healthy();  // Show healthy LED status
     motion.run();           // Ensure motor driver is in a ready state
 
-    // Initialize and store the actual tracker heading in NVS
+    // Restore heading (do NOT overwrite on every boot).
     let heading_tag = "heading";
-    let mut actual_heading: f32 = 90.0;
-
-    // Write initial heading to NVS (as raw bits)
-    match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-         Ok(_) => info!("heading updated"),
-         // You can find the meaning of the error codes in the output of the error branch in:
-         // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-         Err(e) => error!("heading not updated {:?}", e),
-    }; 
-
-    // Load heading from NVS if present, otherwise keep default
-    match nvs.get_u32(heading_tag).unwrap() {
+    let mut actual_heading: f32 = match nvs.get_u32(heading_tag)? {
         Some(v) => {
-            info!("{:?} = {:?}", heading_tag, v);
-            actual_heading = f32::from_bits(v);
+            info!("Restored heading from NVS: {}={}", heading_tag, f32::from_bits(v));
+            f32::from_bits(v)
         }
-        None => info!("{:?} not found", heading_tag),
-    }; 
+        None => {
+            // First boot / no stored heading yet
+            let default_heading: f32 = 90.0;
+            match nvs.set_u32(heading_tag, default_heading.to_bits()) {
+                Ok(_) => info!("Initialized heading in NVS: {}={}", heading_tag, default_heading),
+                Err(e) => warn!("Failed to initialize heading in NVS: {:?}", e),
+            }
+            default_heading
+        }
+    };
+
+    // Restore encoder adjusted ticks snapshot (version-gated).
+    let mut restored_from_snapshot = false;
+    if let Some(v) = nvs.get_u32(NVS_KEY_ENC_SNAPSHOT_VERSION)? {
+        if v == ENC_SNAPSHOT_VERSION {
+            if let Some(enc_ticks_adj) = nvs.get_i32(NVS_KEY_ENC_TICKS_ADJ)? {
+                // Choose the zero offset so that: adjusted = raw - offset == enc_ticks_adj
+                // => offset = raw - enc_ticks_adj
+                let raw = motion.encoder_ticks_raw();
+                motion.set_encoder_zero_offset(raw - enc_ticks_adj);
+                info!(
+                    "Restored encoder snapshot from NVS: {}={} (v={})",
+                    NVS_KEY_ENC_TICKS_ADJ, enc_ticks_adj, v
+                );
+                restored_from_snapshot = true;
+            } else {
+                warn!("Encoder snapshot version present but {} missing", NVS_KEY_ENC_TICKS_ADJ);
+            }
+        } else {
+            warn!(
+                "Encoder snapshot version mismatch: stored={}, expected={}",
+                v, ENC_SNAPSHOT_VERSION
+            );
+        }
+    } else {
+        info!("No encoder snapshot found in NVS; will home normally.");
+    }
+
+    // Keep Motion's internal position consistent for logs/logic.
+    motion.update_position(actual_heading);
 
     let mut mb = PinDriver::input(peripherals.pins.gpio5).unwrap();  // Maintenance 
     let mut eb = PinDriver::input(peripherals.pins.gpio4).unwrap();  // East Button
     let mut wb = PinDriver::input(peripherals.pins.gpio6).unwrap();  // West Button
 
-    // --- ONE-TIME HOMING: Ensure tracker is at physical reference before tracking begins ---
-    let limit_sw_status = motion.find_limit_switch_cw();
-    match limit_sw_status{
-        true => log::info!("Limit switch has returned true"),
-        false => {
-            log::error!("Limit switch has returned false, limit switch could not be found");
-            loop{
-                if let Err(e) = mqtt.publish("device1A/tower/status", b"Critical failure: Limit switch failure!") {
-                    log::error!("Failed to publish critical error message: {:?}", e);
+    // --- Homing ---
+    // If we restored from snapshot, we can skip homing to save time/wear.
+    // If snapshot wasn't available/valid, fall back to the existing homing behavior.
+    if !restored_from_snapshot {
+        let limit_sw_status = motion.find_limit_switch_cw();
+        match limit_sw_status{
+            true => log::info!("Limit switch has returned true"),
+            false => {
+                log::error!("Limit switch has returned false, limit switch could not be found");
+                loop{
+                    if let Err(e) = mqtt.publish("device1A/tower/status", b"Critical failure: Limit switch failure!") {
+                        log::error!("Failed to publish critical error message: {:?}", e);
+                    }
+                    thread::sleep(Duration::from_secs(900));// Loop every 15 minutes
                 }
-                thread::sleep(Duration::from_secs(900));// Loop every 15 minutes
             }
         }
+        thread::sleep(Duration::from_secs(5)); // 
+    } else {
+        log::info!("Skipping homing: restored heading+encoder snapshot from NVS");
     }
-    // Find_limit_switch_cw
-    thread::sleep(Duration::from_secs(5)); // 
 
     loop {
         let st_now = SystemTime::now();//new
@@ -350,6 +387,26 @@ fn main() -> anyhow::Result<()> {
                 Ok(_) => info!("Stored stable heading in NVS: {}", actual_heading),
                 Err(e) => warn!("Failed to store heading in NVS: {:?}", e),
             }
+
+            // ======== Encoder snapshot save to NVS ========
+            let enc_ticks_adj = motion.encoder_ticks_adjusted();
+            if let Err(e) = nvs.set_u32(NVS_KEY_ENC_SNAPSHOT_VERSION, ENC_SNAPSHOT_VERSION) {
+                warn!(
+                    "Failed to store encoder snapshot version in NVS ({}): {:?}",
+                    NVS_KEY_ENC_SNAPSHOT_VERSION, e
+                );
+            }
+            if let Err(e) = nvs.set_i32(NVS_KEY_ENC_TICKS_ADJ, enc_ticks_adj) {
+                warn!(
+                    "Failed to store encoder ticks in NVS ({}): {:?}",
+                    NVS_KEY_ENC_TICKS_ADJ, e
+                );
+            } else {
+                info!(
+                    "Stored encoder snapshot in NVS: {}={} (v={})",
+                    NVS_KEY_ENC_TICKS_ADJ, enc_ticks_adj, ENC_SNAPSHOT_VERSION
+                );
+            }
         } else {
             info!("True return from set tower position");
             info!("Angle offset is less then 5");
@@ -366,151 +423,6 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(300)); // 5-minute cycle  
 
     }
-    //loop {
-        //log::info!("Limit Switch On: {}", motion.switch_pressed());
-        //motion.find_limit_switch();
-        //let now = std::time::Instant::now();                    // Starts a high-resolution timer to measure elapsed time
-        //std::thread::sleep(Duration::from_millis(1000));        // Pauses the thread for 1000 milliseconds (1 second)
-        //std::thread::sleep(Duration::from_nanos(50));
-
-/*         log::info!("Time Gap: {:?}", now.elapsed());            // Logs how much time passed since now
-        log::info!("Maintenance Pressed: {:?}", mb.is_high());  // Reads GPIO input states
-        log::info!("East Pressed: {:?}", eb.is_high());
-        log::info!("West Pressed: {:?}", wb.is_high()); */
-
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(5000);    // Pause the thread for 5 seconds
-        // motion.flip_relay();                                 // Toggle motor 
-        // motion.move_by(((20.0 / 360.0) * (20000.0 * 50.0 * 84.0)) as i64);
-        // motion.flip_relay();
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(10000);
-        // log::info!("Limit Switch On: {}", lmsw.is_high());
-        // log::info!("Limit Switch Level: {:?}", lmsw.get_level());
-        // motion.flip_relay();
-        // motion.move_by(((-20.0 / 360.0) * (20000.0 * 50.0 * 84.0)) as i64);
-        // motion.flip_relay();
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(10000);
-
-        // let val = motion.set_tower_position(&mut calculation, actual_heading as f32, 0);
-        // let val = motion.set_tower_position(&mut calculation, actual_heading as f32, 0);
-        // actual_heading = motion.location();
-        // log::info!("{},", actual_heading);
-
-        // match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-        //     Ok(_) => log::info!("heading updated"),
-        //     // You can find the meaning of the error codes in the output of the error branch in:
-        //     // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-        //     Err(e) => log::info!("heading not updated {:?}", e),
-        // };
-        // esp_idf_svc::hal::delay::FreeRtos::delay_ms(180000);
-    //}
- 
-/*     loop {
-        block_on(async {
-            let ble_device = BLEDevice::take();
-            ble_device
-                .set_power(PowerType::Default, PowerLevel::P9)
-                .unwrap_or_default();
-            let device_name = b"Axum-0.1";
-            let mut ble_scan = BLEScan::new();
-            loop {
-                esp_idf_svc::hal::delay::FreeRtos::delay_ms(1500);
-                let device = ble_scan
-                    .active_scan(true)
-                    .interval(100)
-                    .window(99)
-                    .start(ble_device, 5000, |device, data| {
-                        if let Some(name) = data.name() {
-                            if **name == *device_name {
-                                //log::info!("{:?}", data.service_data());
-                                //log::info!("RSSI: {}", device.rssi());
-                                return Some(*device);
-                            }
-                        }
-                        None::<BLEAdvertisedDevice>
-                    })
-                    .await;
-
-                if let Ok(Some(device)) = device {
-                    let mut client = ble_device.new_client();
-                    client.on_connect(|client| {
-                        log::info!(" ");
-                        client
-                            .update_conn_params(120, 120, 0, 65535)
-                            .unwrap_or_default();
-                    });
-                    client.connect(&device.addr()).await.unwrap_or_default();
-                    loop {
-                        let mut actual_balance = 0;
-                        let service = client
-                            .get_service(uuid128!("00001812-0000-1000-8000-00805f9b34fb"))
-                            .await;
-                        if let Ok(service) = service {
-                            let mut characteristics =
-                                service.get_characteristics().await.unwrap_or_default();
-                            let ldre = characteristics.next();
-                            if let Some(ldre) = ldre {
-                                let ldr = ldre.read_value().await;
-                                if let Ok(ldr) = ldr {
-                                    let actual = <[u8; 4]>::try_from(ldr).unwrap();
-                                    //actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("LDRE: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-
-                            let ldrw = characteristics.next();
-                            if let Some(ldrw) = ldrw {
-                                let ldr = ldrw.read_value().await;
-                                if let Ok(ldr) = ldr {
-                                    let actual = <[u8; 4]>::try_from(ldr).unwrap();
-                                    //actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("LDRW: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-
-                            let bal = characteristics.next();
-                            if let Some(bal) = bal {
-                                let balance = bal.read_value().await;
-                                if let Ok(balance) = balance {
-                                    let actual = <[u8; 4]>::try_from(balance).unwrap();
-                                    actual_balance = i32::from_ne_bytes(actual);
-                                    //log::info!("Balance: {}", i32::from_ne_bytes(actual));
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                        log::info!("Heading: {}", actual_heading);
-                        log::info!("Balance: {}", actual_balance);
-
-                        if actual_heading == 0.0 {
-                            break;
-                        }
-                        let val = motion.set_tower_position(
-                            &mut calculation,
-                            actual_heading as f32,
-                            actual_balance,
-                        );
-                        actual_heading = motion.location();
-                        match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
-                            Ok(_) => log::info!("heading updated"),
-                            // You can find the meaning of the error codes in the output of the error branch in:
-                            // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/error-codes.html
-                            Err(e) => log::info!("heading not updated {:?}", e),
-                        };
-                        if !val {
-                            continue;
-                        }
-                        esp_idf_svc::hal::delay::FreeRtos::delay_ms(120000);
-                    }
-                    client.disconnect().unwrap_or_default();
-                }
-                //let data = deserialize(device_data.1.service_data().unwrap().service_data);
-                //log::info!("{:?}", data);
-                //let val = motion.set_tower_position(&mut calculation, data.loc, data.acc, data.bgp);}
-            }
-            //anyhow::Ok(())
-        })
-    } */
 }
 
 fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
@@ -569,5 +481,4 @@ fn boot_diagnostic(wifi: &mut Wifi, mqtt: &mut Mqtt) -> bool {
         }
     }
     return false; 
-    //return true;
 }

@@ -24,6 +24,27 @@ use ota::OtaUpdater;
 use semver::Version;
 use wifi::wifi::{Wifi, WifiState};
 
+// Constants (Note to self: add these to .env file once done making one)
+const WIFI_CONNECT_DELAY_SECS: u64 = 20;
+const TRACKING_LOOP_SLEEP_SECS: u64 = 300;
+const OTA_CHECK_DELAY_SECS: u64 = 3;
+
+const MQTT_BROKER_URL: &str = "mqttS://mqtt.jantaus.com:9443";
+const MQTT_CLIENT_ID: &str = "device1A_pub";
+
+const DEFAULT_VERSION: &str = "1.0.4";
+const HEADING_TAG: &str = "heading";
+
+const DEFAULT_MQTT_USER: &str = "device1A";
+const DEFAULT_MQTT_PASS: &str = "device1A";
+const DEFAULT_WIFI_SSID: &str = "Power2";
+const DEFAULT_WIFI_PASS: &str = "@Powerfuture22";
+const DEFAULT_TZ_OFFSET_HOURS: i32 = -5;
+
+const DEFAULT_TOWER_LATITUDE: f64 = 32.797868;
+const DEFAULT_TOWER_LONGITUDE: f64 = -96.835597;
+const DEFAULT_TOWER_ID: u32 = 1;
+
 
 // This function must be provided when using embassy-sync/embassy-time-driver
 //Fixes the ldproxy linker error in 'tower'
@@ -63,7 +84,7 @@ fn main() -> anyhow::Result<()> {
 
      
     //CREDENTIALS CONFIGURATION 
-    todo!("Implement a .env");
+    // todo!("Implement a .env");
     
     let mqtt_user = "device1A";
     match nvs.set_str("mqtt_user", mqtt_user) {
@@ -110,7 +131,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut wifi = Wifi::new(peripherals.modem, sysloop.clone(), nvs_default)?;
     log::info!("Waiting for 20 seconds before connecting to wifi");
-    thread::sleep(Duration::from_secs(20));
+    thread::sleep(Duration::from_secs(WIFI_CONNECT_DELAY_SECS));
 	wifi.connect(&real_wifi_ssid, &real_wifi_pass).expect("Wi-Fi connection failed");
 	info!("Current wifi state: {:?}", wifi.state());
     if wifi.state() == WifiState::Disconnected{
@@ -127,7 +148,7 @@ fn main() -> anyhow::Result<()> {
 
     let st_now = SystemTime::now();
     let dt_now_utc: DateTime<Utc> = st_now.clone().into();
-    let timezone_offset_hours: i32 = nvs.get_i32("offset_hours")?.unwrap_or(-5);
+    let timezone_offset_hours: i32 = nvs.get_i32("offset_hours")?.unwrap_or(DEFAULT_TZ_OFFSET_HOURS);
     let local_time: DateTime<FixedOffset> = DateTime::from_naive_utc_and_offset(
         dt_now_utc.naive_utc(),
         FixedOffset::east_opt(timezone_offset_hours * 3600).unwrap(),
@@ -149,8 +170,8 @@ fn main() -> anyhow::Result<()> {
         .to_string();
 
     let mut mqtt = Box::new(Mqtt::new_mqtt(
-        "mqttS://mqtt.jantaus.com:9443",
-        "device1A_pub",
+        MQTT_BROKER_URL,
+        MQTT_CLIENT_ID,
         &real_mqtt_user,
         &real_mqtt_pass,
     )?);
@@ -189,9 +210,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut version_buf = [0u8; 32];
     info!("Setting the firmware version...");
-    nvs.set_str("version", "1.0.4")?;
-
-    const DEFAULT_VERSION: &str = "1.0.4";
+    nvs.set_str("version", DEFAULT_VERSION)?;
     let current_version: Version = nvs
         .get_str("version", &mut version_buf)?
         .map(|s| s.trim().parse::<Version>())
@@ -211,25 +230,25 @@ fn main() -> anyhow::Result<()> {
     .expect("Failed to create OTA updater instance");
 
     info!("Checking for new OTA update in 3 seconds...");
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_secs(OTA_CHECK_DELAY_SECS));
     updater.run_version_compare(&mut nvs)?;
 
      
     //TOWER CONFIGURATION
 
-    let tower_latitude: f64 = 32.797868;
+    let tower_latitude: f64 = DEFAULT_TOWER_LATITUDE;
     match nvs.set_str("tower_latitude", &tower_latitude.to_string()) {
         Ok(_) => info!("Tower latitude has been updated"),
         Err(e) => error!("Tower latitude was not updated {:?}", e),
     };
 
-    let tower_longitude: f64 = -96.835597;
+    let tower_longitude: f64 = DEFAULT_TOWER_LONGITUDE;
     match nvs.set_str("tower_longitude", &tower_longitude.to_string()) {
         Ok(_) => info!("Tower longitude has been updated"),
         Err(e) => error!("Tower longitude was not updated {:?}", e),
     };
 
-    let tower_id: u32 = 1;
+    let tower_id: u32 = DEFAULT_TOWER_ID;
     let latitude = nvs
         .get_str("tower_latitude", &mut buffer)?
         .unwrap_or("0")
@@ -269,7 +288,7 @@ fn main() -> anyhow::Result<()> {
      
     // HEADING INITIALIZATION
 
-    let heading_tag = "heading";
+    let heading_tag = HEADING_TAG;
     let mut actual_heading: f32 = 90.0;
 
     match nvs.set_u32(heading_tag, actual_heading.to_bits()) {
@@ -291,7 +310,7 @@ fn main() -> anyhow::Result<()> {
 
      
     // HOMING SEQUENCE
-    todo!("Implement an encoder to re-position in case of power failure");
+    // todo!("Implement an encoder to re-position in case of power failure");
 
     let limit_sw_status = motion.find_limit_switch_cw();
     match limit_sw_status {
@@ -357,7 +376,7 @@ fn main() -> anyhow::Result<()> {
         payload = format!("The current firmware version is: {}", current_version.to_string());
         mqtt.publish("device1A/firmware/version", payload.as_bytes())?;
         
-        std::thread::sleep(Duration::from_secs(300)); // 5-minute cycle
+        std::thread::sleep(Duration::from_secs(TRACKING_LOOP_SLEEP_SECS)); // 5-minute cycle
     }
 }
 
